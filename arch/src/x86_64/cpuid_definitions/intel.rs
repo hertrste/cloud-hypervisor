@@ -90,7 +90,7 @@ pub static INTEL_CPUID_DEFINITIONS: CpuidDefinitions<147> = const {
 		ValueDefinition{ short: "sse4_1", description: "SSE4.1", bits_range: (19, 19), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
 		ValueDefinition{ short: "sse4_2", description: "SSE4.2", bits_range: (20, 20), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
 		// Set by Cloud hypervisor
-		ValueDefinition{ short: "x2apic", description: "X2APIC support", bits_range: (21, 21), policy: ProfilePolicy::Overwrite(0), migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
+		ValueDefinition{ short: "x2apic", description: "X2APIC support", bits_range: (21, 21), policy: ProfilePolicy::Overwrite(1), migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
 		ValueDefinition{ short: "movbe", description: "MOVBE instruction support", bits_range: (22, 22), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
 		ValueDefinition{ short: "popcnt", description: "POPCNT instruction support", bits_range: (23, 23), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
 		// Set by Cloud hypervisor
@@ -120,7 +120,7 @@ pub static INTEL_CPUID_DEFINITIONS: CpuidDefinitions<147> = const {
 		ValueDefinition{ short: "pae", description: "Physical Address Extensions", bits_range: (6, 6), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
 		ValueDefinition{ short: "mce", description: "Machine Check Exception", bits_range: (7, 7), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
 		ValueDefinition{ short: "cx8", description: "CMPXCHG8B instruction", bits_range: (8, 8), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
-		ValueDefinition{ short: "apic", description: "APIC on-chip", bits_range: (9, 9), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
+		ValueDefinition{ short: "apic", description: "APIC on-chip", bits_range: (9, 9), policy: ProfilePolicy::Overwrite(1), migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
 		// MSR related (maybe not necessary to look into which ones)
 		ValueDefinition{ short: "sep", description: "SYSENTER, SYSEXIT, and associated MSRs", bits_range: (11, 11), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
 		ValueDefinition{ short: "mtrr", description: "Memory Type Range Registers", bits_range: (12, 12), policy: ProfilePolicy::Inherit, migration_compatibility_req: MigrationCompatibilityRequirement::ContainsBits },
