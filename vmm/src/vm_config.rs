@@ -733,6 +733,54 @@ impl ApplyLandlock for DebugConsoleConfig {
     }
 }
 
+/// Display backend type for the display subsystem.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayBackend {
+    #[default]
+    Ramfb,
+}
+
+/// VNC listener type for the display subsystem.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum VncListenerConfig {
+    #[serde(rename = "unix")]
+    Unix(PathBuf),
+    #[serde(rename = "tcp")]
+    Tcp(u16),
+}
+
+/// Configuration for the display subsystem (ramfb + VNC).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DisplayConfig {
+    #[serde(default)]
+    pub backend: DisplayBackend,
+    pub vnc: Option<VncListenerConfig>,
+    #[serde(default = "default_display_width")]
+    pub width: u32,
+    #[serde(default = "default_display_height")]
+    pub height: u32,
+}
+
+fn default_display_width() -> u32 {
+    1024
+}
+
+fn default_display_height() -> u32 {
+    768
+}
+
+impl DisplayConfig {
+    pub const SYNTAX: &str = "ramfb,vnc=unix:<path>|tcp:<port>,width=<w>,height=<h>";
+}
+
+impl ApplyLandlock for DisplayConfig {
+    fn apply_landlock(&self, _landlock: &mut Landlock) -> LandlockResult<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DeviceConfig {
     #[serde(flatten)]
@@ -1098,6 +1146,8 @@ pub struct VmConfig {
     pub serial: SerialConfig,
     #[serde(default)]
     pub console: ConsoleConfig,
+    #[serde(default)]
+    pub display: DisplayConfig,
     #[cfg(target_arch = "x86_64")]
     #[serde(default)]
     pub debug_console: DebugConsoleConfig,

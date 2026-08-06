@@ -135,6 +135,9 @@ pub enum Error {
     /// Failed parsing serial parameters
     #[error("Error parsing --serial")]
     ParseSerial(#[source] OptionParserError),
+    /// Failed parsing display parameters
+    #[error("Error parsing --display")]
+    ParseDisplay(String),
     #[cfg(target_arch = "x86_64")]
     /// Failed parsing debug-console
     #[error("Error parsing --debug-console")]
@@ -467,6 +470,7 @@ pub struct VmParams<'a> {
     pub pmem: Option<Vec<&'a str>>,
     pub serial: &'a str,
     pub console: &'a str,
+    pub display: &'a str,
     #[cfg(target_arch = "x86_64")]
     pub debug_console: &'a str,
     pub devices: Option<Vec<&'a str>>,
@@ -519,6 +523,7 @@ impl<'a> VmParams<'a> {
             .get_many::<String>("net")
             .map(|x| x.map(|y| y as &str).collect());
         let console = args.get_one::<String>("console").unwrap();
+        let display = args.get_one::<String>("display").unwrap();
         #[cfg(target_arch = "x86_64")]
         let debug_console = args.get_one::<String>("debug-console").unwrap().as_str();
         let balloon = args.get_one::<String>("balloon").map(|x| x as &str);
@@ -586,6 +591,7 @@ impl<'a> VmParams<'a> {
             pmem,
             serial,
             console,
+            display,
             #[cfg(target_arch = "x86_64")]
             debug_console,
             devices,
@@ -2376,6 +2382,51 @@ impl DebugConsoleConfig {
     }
 }
 
+impl DisplayConfig {
+    pub fn parse(display: &str) -> Result<Self> {
+        if display == "off" {
+            return Ok(Self {
+                backend: DisplayBackend::Ramfb,
+                vnc: None,
+                width: 1024,
+                height: 768,
+            });
+        }
+
+        let mut parser = OptionParser::new();
+        parser.add("ramfb").add("vnc").add("width").add("height");
+        parser.parse(display).map_err(|e| Error::ParseDisplay(format!("{e}")))?;
+
+        let mut config = Self::default();
+
+        if let Some(vnc) = parser.get("vnc") {
+            if let Some(path) = vnc.strip_prefix("unix:") {
+                config.vnc = Some(VncListenerConfig::Unix(PathBuf::from(path)));
+            } else if let Some(port) = vnc.strip_prefix("tcp:") {
+                config.vnc = Some(VncListenerConfig::Tcp(
+                    port.parse().map_err(|e| Error::ParseDisplay(format!("Invalid VNC port: {e}")))?,
+                ));
+            } else {
+                return Err(Error::ParseDisplay(format!("Invalid VNC listener: {vnc}")));
+            }
+        }
+
+        if let Some(width) = parser.get("width") {
+            config.width = width
+                .parse()
+                .map_err(|e| Error::ParseDisplay(format!("Invalid width: {e}")))?;
+        }
+
+        if let Some(height) = parser.get("height") {
+            config.height = height
+                .parse()
+                .map_err(|e| Error::ParseDisplay(format!("Invalid height: {e}")))?;
+        }
+
+        Ok(config)
+    }
+}
+
 impl DeviceConfig {
     pub const SYNTAX: &'static str = "Direct device assignment parameters \
     \"path=<device_path>,iommu=on|off,id=<device_id>,\
@@ -3459,6 +3510,7 @@ impl VmConfig {
 
         let console = ConsoleConfig::parse(vm_params.console)?;
         let serial = SerialConfig::parse(vm_params.serial)?;
+        let display = DisplayConfig::parse(vm_params.display)?;
         #[cfg(target_arch = "x86_64")]
         let debug_console = DebugConsoleConfig::parse(vm_params.debug_console)?;
 
@@ -3588,6 +3640,7 @@ impl VmConfig {
             pmem,
             serial,
             console,
+            display,
             #[cfg(target_arch = "x86_64")]
             debug_console,
             devices,
@@ -3757,6 +3810,7 @@ impl Clone for VmConfig {
             landlock_rules: self.landlock_rules.clone(),
             #[cfg(feature = "ivshmem")]
             ivshmem: self.ivshmem.clone(),
+            display: self.display.clone(),
             ..*self
         }
     }
