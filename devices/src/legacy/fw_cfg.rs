@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-/// Cloud Hypervisor implementation of Qemu's fw_cfg spec
+/// Cloud Hypervisor implementation of QEMU's fw_cfg spec
 /// https://www.qemu.org/docs/master/specs/fw_cfg.html
 /// Linux kernel fw_cfg driver header
 /// https://github.com/torvalds/linux/blob/master/include/uapi/linux/qemu_fw_cfg.h
@@ -16,7 +16,7 @@ use std::{
     io::{ErrorKind, Read, Result, Seek, SeekFrom},
     mem::offset_of,
     os::unix::fs::FileExt,
-    sync::{Arc, Barrier},
+    sync::{Arc, Barrier, Mutex},
 };
 
 use acpi_tables::rsdp::Rsdp;
@@ -36,6 +36,7 @@ use linux_loader::bootparam::boot_params;
 #[cfg(target_arch = "aarch64")]
 use linux_loader::loader::pe::arm64_image_header as boot_params;
 use log::{debug, error};
+use thiserror::Error;
 use vm_device::BusDevice;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{
@@ -79,6 +80,7 @@ pub const PORT_FW_CFG_WIDTH: u64 = 0x10;
 
 const FW_CFG_SIGNATURE: u16 = 0x00;
 const FW_CFG_ID: u16 = 0x01;
+const FW_CFG_SMP_CPU_COUNT: u16 = 0x05;
 const FW_CFG_KERNEL_SIZE: u16 = 0x08;
 const FW_CFG_INITRD_SIZE: u16 = 0x0b;
 const FW_CFG_KERNEL_DATA: u16 = 0x11;
@@ -91,14 +93,14 @@ const FW_CFG_FILE_DIR: u16 = 0x19;
 const FW_CFG_KNOWN_ITEMS: usize = 0x20;
 
 pub const FW_CFG_FILE_FIRST: u16 = 0x20;
-pub const FW_CFG_DMA_SIGNATURE: [u8; 8] = *b"QEMU CFG";
+pub const FW_CFG_DMA_SIGNATURE_CONTENT: [u8; 8] = *b"QEMU CFG";
+pub const FW_CFG_SIGNATURE_CONTENT: [u8; 4] = *b"QEMU";
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/qemu_fw_cfg.h
 pub const FW_CFG_ACPI_ID: &str = "QEMU0002";
 // Reserved (must be enabled)
 const FW_CFG_F_RESERVED: u8 = 1 << 0;
-// DMA Toggle Bit (enabled by default)
 const FW_CFG_F_DMA: u8 = 1 << 1;
-pub const FW_CFG_FEATURE: [u8; 4] = [FW_CFG_F_RESERVED | FW_CFG_F_DMA, 0, 0, 0];
+pub const FW_CFG_FEATURE: [u8; 4] = [FW_CFG_F_RESERVED, 0, 0, 0];
 
 const COMMAND_ALLOCATE: u32 = 0x1;
 const COMMAND_ADD_POINTER: u32 = 0x2;
@@ -110,6 +112,9 @@ const ALLOC_ZONE_FSEG: u8 = 0x2;
 const FW_CFG_FILENAME_TABLE_LOADER: &str = "etc/table-loader";
 const FW_CFG_FILENAME_RSDP: &str = "acpi/rsdp";
 const FW_CFG_FILENAME_ACPI_TABLES: &str = "acpi/tables";
+
+/// Size of the RAMFB_CONFIG structure (8 + 4 + 4 + 4 + 4 + 4 = 28 bytes)
+const RAMFB_CONFIG_SIZE: usize = 28;
 
 #[derive(Debug)]
 pub enum FwCfgContent {
@@ -171,14 +176,20 @@ impl FwCfgContent {
     }
 }
 
+/// Callback type for handling writes to the `etc/ramfb` fw_cfg item.
+type RamfbWriteCallback = Arc<Mutex<dyn Fn(&[u8]) + Send + Sync>>;
+
 #[derive(Debug, Default)]
 pub struct FwCfgItem {
     pub name: String,
     pub content: FwCfgContent,
 }
 
+#[cfg(all(feature = "fw_cfg", target_arch = "aarch64"))]
+compile_error!(
+    "fw_cfg is not supported on aarch64: the MMIO transport is incomplete and defective."
+);
 /// https://www.qemu.org/docs/master/specs/fw_cfg.html
-#[derive(Debug)]
 pub struct FwCfg {
     selector: u16,
     data_offset: u32,
@@ -186,6 +197,20 @@ pub struct FwCfg {
     items: Vec<FwCfgItem>,                           // 0x20 and above
     known_items: [FwCfgContent; FW_CFG_KNOWN_ITEMS], // 0x0 to 0x19
     memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
+    ramfb_write_callback: Option<RamfbWriteCallback>,
+}
+
+impl std::fmt::Debug for FwCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FwCfg")
+            .field("selector", &self.selector)
+            .field("data_offset", &self.data_offset)
+            .field("dma_address", &self.dma_address)
+            .field("items", &self.items)
+            .field("known_items", &self.known_items)
+            .field("memory", &self.memory)
+            .finish_non_exhaustive()
+    }
 }
 
 #[repr(C)]
@@ -415,23 +440,79 @@ fn create_acpi_loader(acpi_table: AcpiTable) -> [FwCfgItem; 3] {
     [table_loader, acpi_rsdp, apci_tables]
 }
 
+#[derive(Error, Debug)]
+pub enum FwCfgError {
+    #[error("Reading the source (mostly a host file) failed.")]
+    ReadError,
+    #[error("Accessing guest memory for DMA failed")]
+    GuestMemAccessError,
+    #[error("DMA target guest physical address is illegal")]
+    IllegalGpa,
+    #[error("Cannot access the whole guest memory region for DMA")]
+    GuestMemOutOfBoundsAccess(u32),
+    #[error("An illegal item selector was chosen")]
+    IllegalSelector,
+    #[error("The cursor already points to the item'e end")]
+    CursorBehindContent,
+    #[error("The accessed item is too large")]
+    ToLarge,
+}
+
 impl FwCfg {
-    pub fn new(memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>) -> FwCfg {
+    pub fn new(
+        memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
+        boot_vcpus: u32,
+    ) -> FwCfg {
         const DEFAULT_ITEM: FwCfgContent = FwCfgContent::Slice(&[]);
         let mut known_items = [DEFAULT_ITEM; FW_CFG_KNOWN_ITEMS];
-        known_items[FW_CFG_SIGNATURE as usize] = FwCfgContent::Slice(&FW_CFG_DMA_SIGNATURE);
+        known_items[FW_CFG_SIGNATURE as usize] = FwCfgContent::Slice(&FW_CFG_SIGNATURE_CONTENT);
         known_items[FW_CFG_ID as usize] = FwCfgContent::Slice(&FW_CFG_FEATURE);
-        let file_buf = Vec::from(FwCfgFilesHeader { count_be: 0 }.as_mut_bytes());
+        known_items[FW_CFG_SMP_CPU_COUNT as usize] =
+            FwCfgContent::Bytes(boot_vcpus.to_le_bytes().to_vec());
+
+        // Initialize file directory with etc/ramfb and CPU hotplug bugcheck override
+        let ramfb_name = create_file_name("etc/ramfb");
+        let cpuhp_name = create_file_name("opt/org.tianocore/X-Cpuhp-Bugcheck-Override");
+        let mut file_buf: Vec<u8> = Vec::with_capacity(4 + 2 * size_of::<FwCfgFile>());
+        file_buf.extend_from_slice(&2u32.to_be_bytes());
+        let mut cfg_file = FwCfgFile {
+            size_be: (RAMFB_CONFIG_SIZE as u32).to_be(),
+            select_be: FW_CFG_FILE_FIRST.to_be(),
+            _reserved: 0,
+            name: ramfb_name,
+        };
+        file_buf.extend_from_slice(cfg_file.as_mut_bytes());
+        let mut cfg_file_cpuhp = FwCfgFile {
+            size_be: 3u32.to_be(),
+            select_be: (FW_CFG_FILE_FIRST + 1).to_be(),
+            _reserved: 0,
+            name: cpuhp_name,
+        };
+        file_buf.extend_from_slice(cfg_file_cpuhp.as_mut_bytes());
         known_items[FW_CFG_FILE_DIR as usize] = FwCfgContent::Bytes(file_buf);
 
         FwCfg {
             selector: 0,
             data_offset: 0,
             dma_address: 0,
-            items: vec![],
+            items: vec![
+                FwCfgItem {
+                    name: "etc/ramfb".to_owned(),
+                    content: FwCfgContent::Bytes(vec![0u8; RAMFB_CONFIG_SIZE]),
+                },
+                FwCfgItem {
+                    name: "opt/org.tianocore/X-Cpuhp-Bugcheck-Override".to_owned(),
+                    content: FwCfgContent::Slice(b"yes"),
+                },
+            ],
             known_items,
             memory,
+            ramfb_write_callback: None,
         }
+    }
+
+    pub fn set_ramfb_write_callback(&mut self, callback: RamfbWriteCallback) {
+        self.ramfb_write_callback = Some(callback);
     }
 
     pub fn populate_fw_cfg(
@@ -555,6 +636,16 @@ impl FwCfg {
         Ok(())
     }
 
+    fn get_selected_content(&self) -> std::result::Result<&FwCfgContent, FwCfgError> {
+        if let Some(known_item) = self.known_items.get(self.selector as usize) {
+            Ok(known_item)
+        } else if let Some(item) = self.items.get((self.selector - FW_CFG_FILE_FIRST) as usize) {
+            Ok(&item.content)
+        } else {
+            Err(FwCfgError::IllegalSelector)
+        }
+    }
+
     fn dma_read_content(
         &self,
         content: &FwCfgContent,
@@ -593,7 +684,43 @@ impl FwCfg {
         Ok(())
     }
 
+    fn dma_write(&mut self, selector: u16, len: u32, address: u64) -> Result<()> {
+        let item_index = selector.saturating_sub(FW_CFG_FILE_FIRST) as usize;
+        if let Some(item) = self.items.get_mut(item_index) && item.name == "etc/ramfb" {
+            let mut buf = vec![0u8; len as usize];
+            match self.memory.memory().read(&mut buf, GuestAddress(address)) {
+                Ok(n) if n == buf.len() => {},
+                Ok(_) => {
+                    error!("fw_cfg: dma write partial read");
+                    return Err(ErrorKind::InvalidInput.into());
+                },
+                Err(e) => {
+                    error!("fw_cfg: dma write read error: {e:x?}");
+                    return Err(ErrorKind::InvalidInput.into());
+                }
+            }
+            if let FwCfgContent::Bytes(ref mut bytes) = item.content {
+                let start = self.data_offset as usize;
+                let end = start + buf.len();
+                if end <= bytes.len() {
+                    bytes[start..end].copy_from_slice(&buf);
+                    if let Some(ref callback) = self.ramfb_write_callback {
+                        callback.lock().unwrap()(bytes);
+                    }
+                    self.data_offset += len;
+                    return Ok(());
+                }
+            }
+        }
+        Err(ErrorKind::InvalidInput.into())
+    }
+
     fn do_dma(&mut self) {
+        // If the DMA bit is not set, than DMA is a no-op like Write from the traditional interface
+        if (FW_CFG_FEATURE[0] & FW_CFG_F_DMA) == 0 {
+            return;
+        }
+
         let dma_address = self.dma_address;
         let mut access = FwCfgDmaAccess::new_zeroed();
         let dma_access = match self
@@ -616,7 +743,7 @@ impl FwCfg {
         let ret = if control.read() {
             self.dma_read(self.selector, len, addr)
         } else if control.write() {
-            Err(ErrorKind::InvalidInput.into())
+            self.dma_write(self.selector, len, addr)
         } else if control.skip() {
             self.data_offset += len;
             Ok(())
@@ -720,45 +847,37 @@ impl FwCfg {
         Ok(())
     }
 
-    fn read_content(content: &FwCfgContent, offset: u32, data: &mut [u8], size: u32) -> Option<u8> {
-        let start = offset as usize;
-        let end = start + size as usize;
-        match content {
-            FwCfgContent::Bytes(b) => {
-                if b.len() >= size as usize {
-                    data.copy_from_slice(&b[start..end]);
-                }
-            }
-            FwCfgContent::Slice(s) => {
-                if s.len() >= size as usize {
-                    data.copy_from_slice(&s[start..end]);
-                }
-            }
-            FwCfgContent::File(o, f) => {
-                f.read_exact_at(data, o + offset as u64).ok()?;
-            }
-            FwCfgContent::U32(n) => {
-                let bytes = n.to_le_bytes();
-                data.copy_from_slice(&bytes[start..end]);
-            }
+    fn read_content(&mut self, data: &mut [u8]) -> std::result::Result<u32, FwCfgError> {
+        let content_size = self
+            .get_selected_content()?
+            .size()
+            .map_err(|_| FwCfgError::ToLarge)?;
+
+        let remaining_content_bytes = content_size.saturating_sub(self.data_offset);
+        let content_bytes_to_copy = u32::min(remaining_content_bytes, data.len() as u32);
+        let planned_end = self.data_offset + content_bytes_to_copy;
+        let read_size = self
+            .get_selected_content()?
+            .access(self.data_offset)
+            .read(data[..content_bytes_to_copy as usize].as_mut_bytes())
+            .map_err(|_| FwCfgError::ReadError)?;
+
+        // Only relevant for file backed items. These can change between
+        // access so the data used to calculate can be stale. We cannot fix this.
+        if read_size != content_bytes_to_copy as usize {
+            return Err(FwCfgError::ReadError);
         }
-        Some(size as u8)
+
+        self.data_offset = planned_end;
+
+        Ok(content_bytes_to_copy)
     }
 
-    fn read_data(&mut self, data: &mut [u8], size: u32) -> u8 {
-        let ret = if let Some(content) = self.known_items.get(self.selector as usize) {
-            Self::read_content(content, self.data_offset, data, size)
-        } else if let Some(item) = self.items.get((self.selector - FW_CFG_FILE_FIRST) as usize) {
-            Self::read_content(&item.content, self.data_offset, data, size)
+    fn read_data(&mut self, data: &mut [u8]) {
+        if let Ok(read_len) = self.read_content(data) {
+            data[read_len as usize..].fill(0x0);
         } else {
-            error!("fw_cfg: selector {:#x} does not exist.", self.selector);
-            None
-        };
-        if let Some(val) = ret {
-            self.data_offset += size;
-            val
-        } else {
-            0
+            data.fill(0x0);
         }
     }
 }
@@ -766,12 +885,16 @@ impl FwCfg {
 impl BusDevice for FwCfg {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
         let port = offset + PORT_FW_CFG_BASE;
-        let size = data.len();
-        match (port, size) {
-            (PORT_FW_CFG_SELECTOR, _) => {
-                error!("fw_cfg: selector register is write-only.");
+
+        match (port, data.len()) {
+            (PORT_FW_CFG_SELECTOR, 1) => {
+                // Selector register is actually defined write-only. QEMU’s combined PIO region
+                // treats a 1-byte read at this offset as a data read. Bypass to mimic QEMU quirk.
+                self.read_data(data);
             }
-            (PORT_FW_CFG_DATA, _) => _ = self.read_data(data, size as u32),
+            // TODO: For now we need to allow arbitrary length reads from DATA because we cannot
+            // distinguish between on one multi byte long read and multiple single-byte reads.
+            (PORT_FW_CFG_DATA, _) => self.read_data(data),
             (PORT_FW_CFG_DMA_HI, 4) => {
                 let addr = self.dma_address;
                 let addr_hi = (addr >> 32) as u32;
@@ -784,8 +907,10 @@ impl BusDevice for FwCfg {
             }
             _ => {
                 debug!(
-                    "fw_cfg: read from unknown port {port:#x}: {size:#x} bytes and offset {offset:#x}."
+                    "fw_cfg: Unsupported {:#x}-byte read from port {port:#x}.",
+                    data.len()
                 );
+                data.fill(0x0);
             }
         }
     }
@@ -856,11 +981,11 @@ mod unit_tests {
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_64BIT_START.0 as usize)]).unwrap(),
         );
 
-        let mut fw_cfg = FwCfg::new(gm);
+        let mut fw_cfg = FwCfg::new(gm, 1);
 
         let mut data = vec![0u8];
 
-        let mut sig_iter = FW_CFG_DMA_SIGNATURE.into_iter();
+        let mut sig_iter = FW_CFG_SIGNATURE_CONTENT.into_iter();
         fw_cfg.write(0, SELECTOR_OFFSET, &[FW_CFG_SIGNATURE as u8, 0]);
         loop {
             if let Some(char) = sig_iter.next() {
@@ -871,13 +996,14 @@ mod unit_tests {
             }
         }
     }
+
     #[test]
     fn test_kernel_cmdline() {
         let gm = GuestMemoryAtomic::new(
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_64BIT_START.0 as usize)]).unwrap(),
         );
 
-        let mut fw_cfg = FwCfg::new(gm);
+        let mut fw_cfg = FwCfg::new(gm, 1);
 
         let cmdline = *b"cmdline\0";
 
@@ -903,7 +1029,7 @@ mod unit_tests {
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_64BIT_START.0 as usize)]).unwrap(),
         );
 
-        let mut fw_cfg = FwCfg::new(gm);
+        let mut fw_cfg = FwCfg::new(gm, 1);
 
         let temp = TempFile::new().unwrap();
         let mut temp_file = temp.as_file();
@@ -933,7 +1059,7 @@ mod unit_tests {
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), RAM_64BIT_START.0 as usize)]).unwrap(),
         );
 
-        let mut fw_cfg = FwCfg::new(gm);
+        let mut fw_cfg = FwCfg::new(gm, 1);
 
         // Simulate OVMF X-PciMmio64Mb string item for GPU CC passthrough
         let item = FwCfgItem {
@@ -945,8 +1071,8 @@ mod unit_tests {
         let expected = b"262144";
         let mut data = vec![0u8];
 
-        // Select the first file item (FW_CFG_FILE_FIRST = 0x20)
-        fw_cfg.write(0, SELECTOR_OFFSET, &[FW_CFG_FILE_FIRST as u8, 0]);
+        // Select the added file item (index 1, since etc/ramfb occupies index 0)
+        fw_cfg.write(0, SELECTOR_OFFSET, &((FW_CFG_FILE_FIRST + 1) as u16).to_le_bytes());
         for &byte in expected.iter() {
             fw_cfg.read(0, DATA_OFFSET, &mut data);
             assert_eq!(data[0], byte);
@@ -990,7 +1116,7 @@ mod unit_tests {
         // writing the FwCfgDmaAccess to mem (this would just be self.dma_access.as_ref() in guest)
         let _ = mem.write(access.as_mut_bytes(), access_address);
         let mem_m = GuestMemoryAtomic::new(mem.clone());
-        let mut fw_cfg = FwCfg::new(mem_m);
+        let mut fw_cfg = FwCfg::new(mem_m, 1);
         let cfg_item = FwCfgItem {
             name: "code".to_string(),
             content,
@@ -1006,6 +1132,112 @@ mod unit_tests {
         fw_cfg.write(0, DMA_OFFSET, &dma_lo);
         fw_cfg.write(0, DMA_OFFSET + 4, &dma_hi);
         let _ = mem.read(&mut data, GuestAddress(code_address));
-        assert_eq!(data, code);
+
+        // Assert the DMA path is currently deactivated
+        assert_eq!(data, [0u8; 12]);
+        assert_eq!(fw_cfg.data_offset, 0);
+    }
+
+    #[test]
+    fn test_register_invalid_reads_zero_buffer() {
+        // Reads with unsupported size zero the whole buffer in QEMU. We mimic this behavior.
+        let mut fw_cfg = FwCfg::new(GuestMemoryAtomic::new(GuestMemoryMmap::new()), 1);
+        fw_cfg.write(0, SELECTOR_OFFSET, &[FW_CFG_SIGNATURE as u8, 0]);
+        // 1-byte read returns actual data
+        let mut buff = [0xEF; 1];
+        fw_cfg.read(0, DATA_OFFSET, &mut buff);
+        assert_eq!(fw_cfg.data_offset, 1);
+        assert_eq!(buff, [b'Q']);
+    }
+
+    #[test]
+    fn test_register_qemu_selector_read_quirk() {
+        // While defined as write-only, QEMU uses a port-mapping that leaves the select register
+        // readable. For full compatibility we also allow reading from the selector register as a
+        // quirk.
+        let mut fw_cfg = FwCfg::new(GuestMemoryAtomic::new(GuestMemoryMmap::new()), 1);
+        fw_cfg.write(0, SELECTOR_OFFSET, &[FW_CFG_SIGNATURE as u8, 0]);
+        // 1-byte read returns actual data
+        let mut buff = [0xEF; 1];
+        fw_cfg.read(0, SELECTOR_OFFSET, &mut buff);
+        assert_eq!(fw_cfg.data_offset, 1);
+        assert_eq!(buff, [b'Q']);
+        // Forbidden access zeros buffer similar to data register access. Offset isn't moved.
+        let mut buff = [0xEF; 2];
+        fw_cfg.read(0, SELECTOR_OFFSET, &mut buff);
+        assert_eq!(fw_cfg.data_offset, 1);
+        assert_eq!(buff, [0x0; 2]);
+    }
+
+    #[test]
+    fn test_register_reads_past_eof_return_zero() {
+        let mut fw_cfg = FwCfg::new(GuestMemoryAtomic::new(GuestMemoryMmap::new()), 1);
+        fw_cfg.write(0, SELECTOR_OFFSET, &[FW_CFG_SIGNATURE as u8, 0]);
+        let mut buff = [0xEF; 8];
+        let max_offset = FW_CFG_SIGNATURE_CONTENT.len() as u32;
+        for (offset, byte) in buff.iter_mut().enumerate() {
+            fw_cfg.read(0, DATA_OFFSET, byte.as_mut_bytes());
+            let expected_offset = if (offset as u32 + 1) < max_offset {
+                offset as u32 + 1
+            } else {
+                max_offset
+            };
+            assert_eq!(fw_cfg.data_offset, expected_offset);
+        }
+        assert_eq!(buff[..4], FW_CFG_SIGNATURE_CONTENT);
+        assert_eq!(buff[4..], [0; 4]);
+    }
+
+    #[test]
+    fn test_register_reads_with_invalid_selector() {
+        const SELECTOR_INITIALIZED_WITH_DEFAULT: u16 = 0x08;
+        let mut fw_cfg = FwCfg::new(GuestMemoryAtomic::new(GuestMemoryMmap::new()), 1);
+        fw_cfg.known_items[SELECTOR_INITIALIZED_WITH_DEFAULT as usize] = FwCfgContent::Slice(&[]);
+        fw_cfg.write(0, SELECTOR_OFFSET, &[0xFF, 0]);
+        let mut buff = [0xEF_u8; 8];
+        for byte in buff.iter_mut() {
+            fw_cfg.read(0, DATA_OFFSET, byte.as_mut_bytes());
+            assert_eq!(fw_cfg.data_offset, 0);
+        }
+        assert_eq!(buff, [0; 8]);
+
+        fw_cfg.write(
+            0,
+            SELECTOR_OFFSET,
+            &SELECTOR_INITIALIZED_WITH_DEFAULT.to_le_bytes(),
+        );
+        let mut buff = [0xEF_u8; 8];
+        for byte in buff.iter_mut() {
+            fw_cfg.read(0, DATA_OFFSET, byte.as_mut_bytes());
+            assert_eq!(fw_cfg.data_offset, 0);
+        }
+        assert_eq!(buff, [0; 8]);
+    }
+
+    #[test]
+    fn test_register_writing_select_resets_internal_cursor() {
+        let mut fw_cfg = FwCfg::new(GuestMemoryAtomic::new(GuestMemoryMmap::new()), 1);
+        let payload_bytes = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let content = FwCfgContent::Bytes(payload_bytes.to_vec());
+        let cfg_item = FwCfgItem {
+            name: "payload".to_string(),
+            content,
+        };
+        fw_cfg.add_item(cfg_item).unwrap();
+
+        // read the same bytes twice, demonstrating that we can reset the cursor by selecting a new item.
+        for _ in 0..2 {
+            fw_cfg.write(0, SELECTOR_OFFSET, &((FW_CFG_FILE_FIRST + 1) as u16).to_le_bytes());
+            assert_eq!(fw_cfg.data_offset, 0);
+            let mut buffer = [0xEF_u8; 6];
+            const MAX_INDEX: usize = 4;
+            for (index, byte) in buffer.iter_mut().enumerate().take(MAX_INDEX) {
+                fw_cfg.read(0, DATA_OFFSET, byte.as_mut_bytes());
+                assert_eq!(fw_cfg.data_offset as usize, index + 1);
+            }
+            assert_eq!(buffer[..MAX_INDEX], payload_bytes[..MAX_INDEX]);
+            assert_eq!(buffer[MAX_INDEX..], [0xEF; 2]);
+            assert_eq!(fw_cfg.data_offset, MAX_INDEX as u32);
+        }
     }
 }
