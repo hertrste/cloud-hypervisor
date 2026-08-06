@@ -33,6 +33,7 @@ members = [
   "block",
   "cloud-hypervisor",
   "devices",
+  "display",
   "event_monitor",
   "hypervisor",
   "net_util",

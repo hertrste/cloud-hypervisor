@@ -712,6 +712,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "display"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "byteorder",
+ "libc",
+ "log",
+ "thiserror",
+ "vm-memory",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2822,6 +2834,7 @@ dependencies = [
  "clap",
  "devices",
  "dhat",
+ "display",
  "epoll",
  "event_monitor",
  "flume",
