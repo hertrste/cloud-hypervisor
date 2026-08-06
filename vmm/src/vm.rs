@@ -1007,6 +1007,11 @@ impl Vm {
             .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
             .map_err(Error::CpuManager)?;
 
+        // Create fw_cfg device BEFORE KVM/MSHV init so that create_display()
+        // inside create_devices() can wire the RAMFB callback.
+        #[cfg(feature = "fw_cfg")]
+        Self::create_fw_cfg_if_enabled(config, device_manager)?;
+
         // KVM-specific initialization
         #[cfg(feature = "kvm")]
         if is_kvm {
@@ -1019,10 +1024,6 @@ impl Vm {
                 snapshot,
             )?;
         }
-
-        // Create fw_cfg device if configured
-        #[cfg(feature = "fw_cfg")]
-        Self::create_fw_cfg_if_enabled(config, device_manager)?;
 
         Ok(load_payload_handle)
     }
@@ -1097,9 +1098,6 @@ impl Vm {
                 dm_snapshot,
             )
             .map_err(Error::DeviceManager)?;
-
-        #[cfg(feature = "fw_cfg")]
-        Self::create_fw_cfg_if_enabled(config, device_manager)?;
 
         Ok(load_payload_handle)
     }
@@ -1181,14 +1179,21 @@ impl Vm {
         config: &Arc<Mutex<VmConfig>>,
         device_manager: &Arc<Mutex<DeviceManager>>,
     ) -> Result<()> {
-        let fw_cfg_enabled = config
-            .lock()
-            .unwrap()
-            .payload
-            .as_ref()
-            .is_some_and(|p| p.fw_cfg_config.is_some());
+        let fw_cfg_needed = {
+            let cfg = config.lock().unwrap();
+            let fw_cfg_enabled = cfg
+                .payload
+                .as_ref()
+                .is_some_and(|p| p.fw_cfg_config.is_some());
 
-        if fw_cfg_enabled {
+            // Also enable fw_cfg when display (RAMFB VNC) is configured,
+            // since QemuRamfbDxe requires fw_cfg to discover framebuffer parameters.
+            let display_needs_fw_cfg = cfg.display.vnc.is_some();
+
+            fw_cfg_enabled || display_needs_fw_cfg
+        };
+
+        if fw_cfg_needed {
             device_manager
                 .lock()
                 .unwrap()
