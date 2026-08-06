@@ -32,10 +32,10 @@ use vmm::vm_config::FwCfgConfig;
 #[cfg(feature = "ivshmem")]
 use vmm::vm_config::IvshmemConfig;
 use vmm::vm_config::{
-    BalloonConfig, ConsoleConfig, DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig,
-    LandlockConfig, NetConfig, NumaConfig, PciSegmentConfig, PlatformConfig, PmemConfig,
-    RateLimiterGroupConfig, RngConfig, SerialConfig, TpmConfig, UserDeviceConfig, VdpaConfig,
-    VmConfig, VsockConfig,
+    BalloonConfig, ConsoleConfig, DeviceConfig, DisplayConfig, DiskConfig, FsConfig,
+    GenericVhostUserConfig, LandlockConfig, NetConfig, NumaConfig, PciSegmentConfig,
+    PlatformConfig, PmemConfig, RateLimiterGroupConfig, RngConfig, SerialConfig, TpmConfig,
+    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::block_signal;
@@ -168,6 +168,11 @@ fn get_cli_options_sorted(
             .long("console")
             .help(ConsoleConfig::SYNTAX)
             .default_value("tty")
+            .group("vm-config"),
+        Arg::new("display")
+            .long("display")
+            .help(DisplayConfig::SYNTAX)
+            .default_value("off")
             .group("vm-config"),
         Arg::new("cpus")
             .long("cpus")
