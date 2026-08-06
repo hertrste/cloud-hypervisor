@@ -9,7 +9,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Seek, SeekFrom, stdout};
 use std::num::Wrapping;
@@ -60,6 +60,12 @@ use devices::legacy::{
     FwCfg,
     fw_cfg::{PORT_FW_CFG_BASE, PORT_FW_CFG_WIDTH},
 };
+#[cfg(feature = "fw_cfg")]
+use display::framebuffer::FramebufferSurface;
+#[cfg(feature = "fw_cfg")]
+use display::ramfb::{RamfbConfig, RAMFB_CONFIG_SIZE};
+#[cfg(feature = "fw_cfg")]
+use display::vnc::{VncListenerType, VncServer, VncServerConfig};
 #[cfg(feature = "pvmemcontrol")]
 use devices::pvmemcontrol::{PvmemcontrolBusDevice, PvmemcontrolPciDevice};
 use devices::{AcpiNotificationFlags, interrupt_controller};
@@ -123,8 +129,9 @@ use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
     ConsoleOutputMode, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PciDeviceCommonConfig,
-    PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig,
+    PciDeviceCommonConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig,
+    VncListenerConfig, VsockConfig,
 };
 use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node};
 
@@ -679,6 +686,14 @@ pub enum DeviceManagerError {
         specified: ImageType,
         detected: ImageType,
     },
+
+    /// Failed to spawn VNC server thread.
+    #[error("Failed to spawn VNC server thread")]
+    VncServerSpawn(#[source] std::io::Error),
+
+    /// Failed to spawn VNC input bridge thread.
+    #[error("Failed to spawn VNC input bridge thread")]
+    VncBridgeSpawn(#[source] std::io::Error),
 }
 
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
@@ -1146,6 +1161,21 @@ pub struct DeviceManager {
     #[cfg(feature = "fw_cfg")]
     fw_cfg: Option<Arc<Mutex<FwCfg>>>,
 
+    #[cfg(feature = "fw_cfg")]
+    framebuffer_surface: Option<Arc<FramebufferSurface>>,
+
+    #[cfg(feature = "fw_cfg")]
+    vnc_server: Option<VncServer>,
+
+    #[cfg(feature = "fw_cfg")]
+    input_channel: Option<Arc<Mutex<VecDeque<devices::legacy::InputEvent>>>>,
+
+    #[cfg(feature = "fw_cfg")]
+    vnc_server_handle: Option<std::thread::JoinHandle<()>>,
+
+    #[cfg(feature = "fw_cfg")]
+    vnc_bridge_handle: Option<std::thread::JoinHandle<()>>,
+
     #[cfg(feature = "ivshmem")]
     // ivshmem device
     ivshmem_device: Option<Arc<Mutex<devices::IvshmemDevice>>>,
@@ -1436,6 +1466,16 @@ impl DeviceManager {
             mmio_regions: Arc::new(Mutex::new(Vec::new())),
             #[cfg(feature = "fw_cfg")]
             fw_cfg: None,
+            #[cfg(feature = "fw_cfg")]
+            framebuffer_surface: None,
+            #[cfg(feature = "fw_cfg")]
+            vnc_server: None,
+            #[cfg(feature = "fw_cfg")]
+            input_channel: None,
+            #[cfg(feature = "fw_cfg")]
+            vnc_server_handle: None,
+            #[cfg(feature = "fw_cfg")]
+            vnc_bridge_handle: None,
             #[cfg(feature = "ivshmem")]
             ivshmem_device: None,
             _acpi_cpu_hotplug_controller: acpi_cpu_hotplug_controller,
@@ -1504,11 +1544,18 @@ impl DeviceManager {
         }
 
         #[cfg(target_arch = "x86_64")]
-        self.add_legacy_devices(
-            self.reset_evt
-                .try_clone()
-                .map_err(DeviceManagerError::EventFd)?,
-        )?;
+        {
+            #[cfg(feature = "fw_cfg")]
+            {
+                // Create input channel for VNC -> i8042 keyboard/mouse events
+                self.input_channel = Some(Arc::new(Mutex::new(VecDeque::new())));
+            }
+            self.add_legacy_devices(
+                self.reset_evt
+                    .try_clone()
+                    .map_err(DeviceManagerError::EventFd)?,
+            )?;
+        }
 
         #[cfg(target_arch = "aarch64")]
         self.add_legacy_devices(legacy_interrupt_manager.as_ref(), snapshot)?;
@@ -1565,6 +1612,9 @@ impl DeviceManager {
             self.ivshmem_device = self.add_ivshmem_device(ivshmem, snapshot)?;
         }
 
+        #[cfg(feature = "fw_cfg")]
+        self.create_display()?;
+
         Ok(())
     }
 
@@ -1572,6 +1622,7 @@ impl DeviceManager {
     pub fn create_fw_cfg_device(&mut self) -> Result<(), DeviceManagerError> {
         let fw_cfg = Arc::new(Mutex::new(devices::legacy::FwCfg::new(
             self.memory_manager.lock().as_ref().unwrap().guest_memory(),
+            self.config.lock().unwrap().cpus.boot_vcpus,
         )));
 
         self.fw_cfg = Some(fw_cfg.clone());
@@ -1611,6 +1662,110 @@ impl DeviceManager {
                 },
             );
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "fw_cfg")]
+    fn create_display(&mut self) -> DeviceManagerResult<()> {
+        let config = self.config.lock().unwrap();
+        let display_config = &config.display;
+
+        if display_config.vnc.is_none() {
+            return Ok(());
+        }
+
+        let guest_memory = self.memory_manager.lock().unwrap().guest_memory();
+        let surface = Arc::new(FramebufferSurface::new(guest_memory));
+
+        let surface_callback = Arc::clone(&surface);
+        let callback = Arc::new(Mutex::new(move |bytes: &[u8]| {
+            if bytes.len() == RAMFB_CONFIG_SIZE {
+                let mut buf = [0u8; RAMFB_CONFIG_SIZE];
+                buf.copy_from_slice(bytes);
+                let ramfb_config = RamfbConfig::from_be_bytes(&buf);
+                if ramfb_config.address != 0 {
+                    surface_callback.set_config(ramfb_config);
+                }
+            }
+        }));
+
+        if let Some(ref fw_cfg) = self.fw_cfg {
+            fw_cfg.lock().unwrap().set_ramfb_write_callback(callback);
+        }
+
+        let vnc_config = match &display_config.vnc {
+            Some(VncListenerConfig::Tcp(port)) => VncServerConfig {
+                listener: VncListenerType::Tcp { port: *port },
+            },
+            Some(VncListenerConfig::Unix(path)) => VncServerConfig {
+                listener: VncListenerType::Unix {
+                    path: path.to_string_lossy().to_string(),
+                },
+            },
+            None => return Ok(()),
+        };
+
+        let (input_sender, input_receiver) = std::sync::mpsc::channel();
+        let surface_for_vnc = Arc::clone(&surface);
+        let vnc_server = VncServer::new(surface_for_vnc, vnc_config, input_sender);
+        let vnc_handle = vnc_server.spawn().map_err(|e| {
+            error!("vnc: failed to spawn VNC server: {e}");
+            DeviceManagerError::VncServerSpawn(e)
+        })?;
+
+        // Spawn bridge thread to forward VNC input events to i8042
+        if let Some(input_channel) = self.input_channel.as_ref() {
+            let input_channel: Arc<Mutex<VecDeque<devices::legacy::InputEvent>>> =
+                Arc::clone(input_channel);
+            let bridge_handle = std::thread::Builder::new()
+                .name("ch-vnc-bridge".to_string())
+                .spawn(move || {
+                    for event in input_receiver.iter() {
+                        let i8042_event = match event {
+                            display::vnc::VncInputEvent::Keyboard { key, down } => {
+                                devices::legacy::InputEvent::Keyboard {
+                                    key,
+                                    pressed: down,
+                                }
+                            }
+                            display::vnc::VncInputEvent::MouseButton { button, down } => {
+                                let mut buttons = 0u8;
+                                if down {
+                                    buttons |= 1 << button;
+                                }
+                                devices::legacy::InputEvent::Mouse {
+                                    buttons,
+                                    dx: 0,
+                                    dy: 0,
+                                }
+                            }
+                            display::vnc::VncInputEvent::PointerMove { dx, dy } => {
+                                devices::legacy::InputEvent::Mouse {
+                                    buttons: 0,
+                                    dx,
+                                    dy,
+                                }
+                            }
+                            display::vnc::VncInputEvent::PointerPosition { .. } => {
+                                continue;
+                            }
+                        };
+                        input_channel.lock().unwrap().push_back(i8042_event);
+                    }
+                })
+                .map_err(|e| {
+                    error!("vnc: failed to spawn bridge thread: {e}");
+                    DeviceManagerError::VncBridgeSpawn(std::io::Error::other(
+                        format!("failed to spawn bridge thread: {e}"),
+                    ))
+                })?;
+            self.vnc_bridge_handle = Some(bridge_handle);
+        }
+
+        self.framebuffer_surface = Some(surface);
+        self.vnc_server = Some(vnc_server);
+        self.vnc_server_handle = Some(vnc_handle);
+
         Ok(())
     }
 
@@ -2040,11 +2195,20 @@ impl DeviceManager {
             .unwrap()
             .vcpus_pause_signalled()
             .clone();
-        // Add a shutdown device (i8042)
+        // Add a shutdown device (i8042) with PS/2 keyboard/mouse support
+        #[cfg(feature = "fw_cfg")]
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
             reset_evt.try_clone().unwrap(),
             vcpus_kill_signalled.clone(),
             vcpus_pause_signalled.clone(),
+            self.input_channel.as_ref().map(Arc::clone),
+        )));
+        #[cfg(not(feature = "fw_cfg"))]
+        let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
+            reset_evt.try_clone().unwrap(),
+            vcpus_kill_signalled.clone(),
+            vcpus_pause_signalled.clone(),
+            None,
         )));
 
         self.bus_devices
@@ -2052,7 +2216,7 @@ impl DeviceManager {
 
         self.address_manager
             .io_bus
-            .insert(i8042, 0x61, 0x4)
+            .insert(i8042, 0x60, 0x5)
             .map_err(DeviceManagerError::BusError)?;
         {
             // Add a CMOS emulated device
