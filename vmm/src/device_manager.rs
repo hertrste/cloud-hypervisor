@@ -1679,13 +1679,27 @@ impl DeviceManager {
 
         let surface_callback = Arc::clone(&surface);
         let callback = Arc::new(Mutex::new(move |bytes: &[u8]| {
+            info!("ramfb: callback triggered with {} bytes", bytes.len());
             if bytes.len() == RAMFB_CONFIG_SIZE {
                 let mut buf = [0u8; RAMFB_CONFIG_SIZE];
                 buf.copy_from_slice(bytes);
                 let ramfb_config = RamfbConfig::from_be_bytes(&buf);
-                if ramfb_config.address != 0 {
+                let r_addr = ramfb_config.address;
+                let r_fourcc = ramfb_config.fourcc;
+                let r_flags = ramfb_config.flags;
+                let r_width = ramfb_config.width;
+                let r_height = ramfb_config.height;
+                let r_stride = ramfb_config.stride;
+                info!(
+                    "ramfb: config received address=0x{:x}, fourcc=0x{:08X}, flags=0x{:08X}, \
+                     width={}, height={}, stride={}",
+                    r_addr, r_fourcc, r_flags, r_width, r_height, r_stride
+                );
+                if r_addr != 0 {
                     surface_callback.set_config(ramfb_config);
                 }
+            } else {
+                debug!("ramfb: callback with unexpected size {} (expected {})", bytes.len(), RAMFB_CONFIG_SIZE);
             }
         }));
 

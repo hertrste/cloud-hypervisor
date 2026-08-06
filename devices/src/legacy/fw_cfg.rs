@@ -35,7 +35,7 @@ use bitfield_struct::bitfield;
 use linux_loader::bootparam::boot_params;
 #[cfg(target_arch = "aarch64")]
 use linux_loader::loader::pe::arm64_image_header as boot_params;
-use log::{debug, error};
+use log::{debug, error, info};
 use thiserror::Error;
 use vm_device::BusDevice;
 use vm_memory::bitmap::AtomicBitmap;
@@ -100,7 +100,7 @@ pub const FW_CFG_ACPI_ID: &str = "QEMU0002";
 // Reserved (must be enabled)
 const FW_CFG_F_RESERVED: u8 = 1 << 0;
 const FW_CFG_F_DMA: u8 = 1 << 1;
-pub const FW_CFG_FEATURE: [u8; 4] = [FW_CFG_F_RESERVED, 0, 0, 0];
+pub const FW_CFG_FEATURE: [u8; 4] = [FW_CFG_F_RESERVED | FW_CFG_F_DMA, 0, 0, 0];
 
 const COMMAND_ALLOCATE: u32 = 0x1;
 const COMMAND_ADD_POINTER: u32 = 0x2;
@@ -222,25 +222,25 @@ struct FwCfgDmaAccess {
 }
 
 // https://github.com/torvalds/linux/blob/master/include/uapi/linux/qemu_fw_cfg.h#L67
+// Bit positions per QEMU fw_cfg DMA control field spec:
+//   Bit 0: FW_CFG_DMA_CTL_ERROR (0x01)
+//   Bit 1: FW_CFG_DMA_CTL_READ  (0x02)
+//   Bit 2: FW_CFG_DMA_CTL_SKIP  (0x04)
+//   Bit 3: FW_CFG_DMA_CTL_SELECT (0x08)
+//   Bit 4: FW_CFG_DMA_CTL_WRITE (0x10)
 #[bitfield(u32)]
 struct AccessControl {
     // FW_CFG_DMA_CTL_ERROR = 0x01
     error: bool,
     // FW_CFG_DMA_CTL_READ = 0x02
     read: bool,
-    #[bits(1)]
-    _unused2: u8,
     // FW_CFG_DMA_CTL_SKIP = 0x04
     skip: bool,
-    #[bits(3)]
-    _unused3: u8,
-    // FW_CFG_DMA_CTL_ERROR = 0x08
+    // FW_CFG_DMA_CTL_SELECT = 0x08
     select: bool,
-    #[bits(7)]
-    _unused4: u8,
     // FW_CFG_DMA_CTL_WRITE = 0x10
     write: bool,
-    #[bits(16)]
+    #[bits(27)]
     _unused: u32,
 }
 
@@ -685,6 +685,10 @@ impl FwCfg {
     }
 
     fn dma_write(&mut self, selector: u16, len: u32, address: u64) -> Result<()> {
+        info!(
+            "fw_cfg: dma_write selector={:#x}, len={}, address={:#x}",
+            selector, len, address
+        );
         let item_index = selector.saturating_sub(FW_CFG_FILE_FIRST) as usize;
         if let Some(item) = self.items.get_mut(item_index) && item.name == "etc/ramfb" {
             let mut buf = vec![0u8; len as usize];
@@ -704,8 +708,15 @@ impl FwCfg {
                 let end = start + buf.len();
                 if end <= bytes.len() {
                     bytes[start..end].copy_from_slice(&buf);
+                    debug!(
+                        "fw_cfg: dma_write copied {} bytes at offset {}, total={}",
+                        buf.len(), start, bytes.len()
+                    );
                     if let Some(ref callback) = self.ramfb_write_callback {
                         callback.lock().unwrap()(bytes);
+                        debug!("fw_cfg: ramfb callback invoked");
+                    } else {
+                        debug!("fw_cfg: ramfb callback is None!");
                     }
                     self.data_offset += len;
                     return Ok(());
@@ -722,6 +733,7 @@ impl FwCfg {
         }
 
         let dma_address = self.dma_address;
+        debug!("fw_cfg: do_dma entered, dma_address={:#x}, selector={:#x}", dma_address, self.selector);
         let mut access = FwCfgDmaAccess::new_zeroed();
         let dma_access = match self
             .memory
@@ -734,9 +746,20 @@ impl FwCfg {
                 return;
             }
         };
-        let control = AccessControl(u32::from_be(dma_access.control_be));
+        let control_val = u32::from_be(dma_access.control_be);
+        let control = AccessControl(control_val);
+        info!(
+            "fw_cfg: do_dma control=0x{:08X} error={} read={} skip={} select={} write={}",
+            control_val,
+            control.error(),
+            control.read(),
+            control.skip(),
+            control.select(),
+            control.write()
+        );
         if control.select() {
-            self.selector = control.select() as u16;
+            self.data_offset = 0;
+            info!("fw_cfg: dma select selector={:#x}", self.selector);
         }
         let len = u32::from_be(dma_access.length_be);
         let addr = u64::from_be(dma_access.address_be);
