@@ -468,8 +468,9 @@ fn server_init<W: Write>(writer: &mut W, width: u32, height: u32) -> Result<()> 
     let name = b"Cloud Hypervisor";
     let name_len = name.len() as u32;
 
-    writer.write_all(&width.to_be_bytes())?;
-    writer.write_all(&height.to_be_bytes())?;
+    // RFB ServerInit: width and height are CARD16 (2 bytes each)
+    writer.write_all(&((width as u16).to_be_bytes()))?;
+    writer.write_all(&((height as u16).to_be_bytes()))?;
 
     // Pixel format: XRGB8888 (16 bytes)
     // bits_per_pixel=32, depth=24, big_endian=0, true_color=1
@@ -512,16 +513,18 @@ fn send_framebuffer_update<W: Write>(
         ));
     }
 
+    // Framebuffer update message:
+    // message-type=0 (1 byte), padding (1 byte), number-of-rects (CARD16)
     writer.write_all(&[0])?;
     writer.write_all(&[0])?;
     writer.write_all(&[0, 1])?;
 
-    writer.write_all(&[0, 0])?;
-    writer.write_all(&[0, 0])?;
-    writer.write_all(&[0, 0])?;
-    writer.write_all(&width.to_be_bytes())?;
-    writer.write_all(&height.to_be_bytes())?;
-    writer.write_all(&[0, 0, 0, 0])?;
+    // Rectangle: x, y, width, height (all CARD16), encoding (CARD32)
+    writer.write_all(&[0, 0])?;         // x = 0
+    writer.write_all(&[0, 0])?;         // y = 0
+    writer.write_all(&((width as u16).to_be_bytes()))?;    // width CARD16
+    writer.write_all(&((height as u16).to_be_bytes()))?;   // height CARD16
+    writer.write_all(&[0, 0, 0, 0])?;  // encoding = 0 (RAW)
 
     writer.write_all(&data[..fb_size as usize])?;
     writer.flush()?;
