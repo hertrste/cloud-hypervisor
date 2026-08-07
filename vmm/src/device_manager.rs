@@ -1804,10 +1804,10 @@ impl DeviceManager {
         }
 
         let vnc_config = match &display_config.vnc {
-            Some(VncListenerConfig::Tcp(port)) => VncServerConfig {
+            Some(VncListenerConfig::Tcp { port }) => VncServerConfig {
                 listener: VncListenerType::Tcp { port: *port },
             },
-            Some(VncListenerConfig::Unix(path)) => VncServerConfig {
+            Some(VncListenerConfig::Unix { path }) => VncServerConfig {
                 listener: VncListenerType::Unix {
                     path: path.to_string_lossy().to_string(),
                 },

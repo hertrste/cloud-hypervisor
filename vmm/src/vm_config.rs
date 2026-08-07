@@ -746,13 +746,13 @@ pub enum DisplayBackend {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum VncListenerConfig {
     #[serde(rename = "unix")]
-    Unix(PathBuf),
+    Unix { path: PathBuf },
     #[serde(rename = "tcp")]
-    Tcp(u16),
+    Tcp { port: u16 },
 }
 
 /// Configuration for the display subsystem (ramfb + VNC).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DisplayConfig {
     #[serde(default)]
     pub backend: DisplayBackend,
@@ -769,6 +769,17 @@ fn default_display_width() -> u32 {
 
 fn default_display_height() -> u32 {
     768
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            backend: DisplayBackend::default(),
+            vnc: None,
+            width: default_display_width(),
+            height: default_display_height(),
+        }
+    }
 }
 
 impl DisplayConfig {

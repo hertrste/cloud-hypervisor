@@ -2394,18 +2394,26 @@ impl DisplayConfig {
         }
 
         let mut parser = OptionParser::new();
-        parser.add("ramfb").add("vnc").add("width").add("height");
+        parser
+            .add_valueless("ramfb")
+            .add("vnc")
+            .add("width")
+            .add("height");
         parser.parse(display).map_err(|e| Error::ParseDisplay(format!("{e}")))?;
 
         let mut config = Self::default();
 
         if let Some(vnc) = parser.get("vnc") {
             if let Some(path) = vnc.strip_prefix("unix:") {
-                config.vnc = Some(VncListenerConfig::Unix(PathBuf::from(path)));
+                config.vnc = Some(VncListenerConfig::Unix {
+                    path: PathBuf::from(path),
+                });
             } else if let Some(port) = vnc.strip_prefix("tcp:") {
-                config.vnc = Some(VncListenerConfig::Tcp(
-                    port.parse().map_err(|e| Error::ParseDisplay(format!("Invalid VNC port: {e}")))?,
-                ));
+                config.vnc = Some(VncListenerConfig::Tcp {
+                    port: port
+                        .parse()
+                        .map_err(|e| Error::ParseDisplay(format!("Invalid VNC port: {e}")))?,
+                });
             } else {
                 return Err(Error::ParseDisplay(format!("Invalid VNC listener: {vnc}")));
             }

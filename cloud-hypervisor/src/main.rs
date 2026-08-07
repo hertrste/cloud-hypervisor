@@ -936,8 +936,8 @@ mod unit_tests {
     use vmm::vm_config::DebugConsoleConfig;
     use vmm::vm_config::{
         CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures,
-        CpusConfig, HotplugMethod, MemoryConfig, PayloadConfig, PciDeviceCommonConfig, RngConfig,
-        SerialConfig, VmConfig,
+        CpusConfig, DisplayConfig, HotplugMethod, MemoryConfig, PayloadConfig,
+        PciDeviceCommonConfig, RngConfig, SerialConfig, VmConfig,
     };
 
     use crate::test_util::assert_args_sorted;
@@ -991,6 +991,7 @@ mod unit_tests {
                 core_scheduling: CoreScheduling::Vm,
                 profile: Default::default(),
             },
+            display: DisplayConfig::default(),
             memory: MemoryConfig {
                 size: 536_870_912,
                 mergeable: false,
@@ -2036,6 +2037,55 @@ mod unit_tests {
         .iter()
         .for_each(|(cli, openapi, equal)| {
             compare_vm_config_cli_vs_json(cli, openapi, *equal);
+        });
+    }
+
+    #[test]
+    fn test_valid_vm_config_display() {
+        [
+            (
+                vec![
+                    "cloud-hypervisor",
+                    "--kernel",
+                    "/path/to/kernel",
+                    "--display",
+                    "ramfb,vnc=tcp:5900,width=1920,height=1080",
+                ],
+                r#"{
+                    "payload": {"kernel": "/path/to/kernel"},
+                    "display": {
+                        "backend": "ramfb",
+                        "vnc": {"type": "tcp", "port": 5900},
+                        "width": 1920,
+                        "height": 1080
+                    }
+                }"#,
+            ),
+            (
+                vec![
+                    "cloud-hypervisor",
+                    "--kernel",
+                    "/path/to/kernel",
+                    "--display",
+                    "ramfb,vnc=unix:/tmp/cloud-hypervisor-vnc.sock",
+                ],
+                r#"{
+                    "payload": {"kernel": "/path/to/kernel"},
+                    "display": {
+                        "backend": "ramfb",
+                        "vnc": {
+                            "type": "unix",
+                            "path": "/tmp/cloud-hypervisor-vnc.sock"
+                        },
+                        "width": 1024,
+                        "height": 768
+                    }
+                }"#,
+            ),
+        ]
+        .iter()
+        .for_each(|(cli, openapi)| {
+            compare_vm_config_cli_vs_json(cli, openapi, true);
         });
     }
 
