@@ -297,7 +297,7 @@ fn run_vnc_server(
     on_disconnect: Option<Box<dyn Fn() + Send>>,
 ) {
     let listener = match &config.listener {
-        VncListenerType::Tcp { port } => match TcpListener::bind(format!("127.0.0.1:{port}")) {
+        VncListenerType::Tcp { port } => match TcpListener::bind(format!("0.0.0.0:{port}")) {
             Ok(l) => {
                 info!("vnc: listening on TCP 127.0.0.1:{port}");
                 VncListener::Tcp(l)
