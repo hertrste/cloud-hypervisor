@@ -318,6 +318,11 @@ fn create_facp_table(dsdt_offset: GuestAddress, device_manager: &DeviceManager) 
     // ARM_BOOT_ARCH: enable PSCI with HVC enable-method
     facp.write(129, 3u16);
 
+    // x86_64 specific fields
+    #[cfg(target_arch = "x86_64")]
+    // IAPC_BOOT_ARCH: Legacy 8042 port present + keyboard controller present
+    facp.write(130, 0x0003u16);
+
     // Architecture common fields
     // HW_REDUCED_ACPI, RESET_REG_SUP, TMR_VAL_EXT
     let fadt_flags: u32 = (1 << 20) | (1 << 10) | (1 << 8);

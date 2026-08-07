@@ -5860,6 +5860,48 @@ impl Aml for DeviceManager {
             .to_aml_bytes(sink);
         }
 
+        // PS/2 keyboard device
+        #[cfg(target_arch = "x86_64")]
+        aml::Device::new(
+            "_SB_.KBD ".into(),
+            vec![
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0303")),
+                &aml::Name::new("_CID".into(), &aml::EISAName::new("PNP030B")),
+                &aml::Name::new("_UID".into(), &aml::ZERO),
+                &aml::Name::new(
+                    "_CRS".into(),
+                    &aml::ResourceTemplate::new(vec![
+                        &aml::IO::new(0x0060, 0x0060, 0x00, 0x01),
+                        &aml::IO::new(0x0064, 0x0064, 0x00, 0x01),
+                        &aml::Interrupt::new(true, true, false, false, 1),
+                    ]),
+                ),
+            ],
+        )
+        .to_aml_bytes(sink);
+
+        // PS/2 mouse device
+        #[cfg(target_arch = "x86_64")]
+        aml::Device::new(
+            "_SB_.MOU ".into(),
+            vec![
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0F03")),
+                &aml::Name::new("_CID".into(), &aml::EISAName::new("PNP0F13")),
+                &aml::Name::new("_UID".into(), &aml::ZERO),
+                &aml::Name::new(
+                    "_CRS".into(),
+                    &aml::ResourceTemplate::new(vec![&aml::Interrupt::new(
+                        true,
+                        true,
+                        false,
+                        false,
+                        12,
+                    )]),
+                ),
+            ],
+        )
+        .to_aml_bytes(sink);
+
         create_s5_sleep_state(sink);
 
         aml::Device::new(

@@ -24,7 +24,7 @@ const OFFSET_COMMAND: u64 = 4;
 const CMD_READ_PORT_A: u8 = 0x20;
 const CMD_READ_PORT_B: u8 = 0x21;
 const CMD_TEST_CONTROLLER: u8 = 0xAA;
-const CMD_DISABLE_SECONDARY: u8 = 0xAB;
+const CMD_DISABLE_SECONDARY: u8 = 0xA7;
 const CMD_DISABLE_KEYBOARD: u8 = 0xAD;
 const CMD_ENABLE_KEYBOARD: u8 = 0xAE;
 const CMD_ENABLE_SECONDARY: u8 = 0xA8;
@@ -240,6 +240,11 @@ pub struct I8042Device {
     // Input buffer for command data (written to 0x60 during command sequence)
     input_buffer: Option<u8>,
 
+    // Port A register (keyboard/mouse presence and status)
+    // Bit 0: keyboard output buffer full / keyboard present
+    // Bit 4: mouse output buffer full / mouse present
+    port_a: u8,
+
     // Port B register value
     port_b: u8,
 
@@ -275,7 +280,8 @@ impl I8042Device {
             status: STATUS_SYSTEM_FLAG,
             output_buffer: VecDeque::new(),
             input_buffer: None,
-            port_b: 0x20,
+            port_a: 0x00,
+            port_b: 0x23,
             keyboard_enabled: true,
             mouse_enabled: true,
             pending_command: None,
@@ -387,21 +393,25 @@ impl I8042Device {
             CMD_DISABLE_KEYBOARD => {
                 debug!("i8042: keyboard disabled");
                 self.keyboard_enabled = false;
+                self.port_a &= !0x01;
                 self.push_output(0xFA);
             }
             CMD_ENABLE_KEYBOARD => {
                 debug!("i8042: keyboard enabled");
                 self.keyboard_enabled = true;
+                self.port_a |= 0x01;
                 self.push_output(0xFA);
             }
             CMD_DISABLE_SECONDARY => {
                 debug!("i8042: mouse/secondary disabled");
                 self.mouse_enabled = false;
+                self.port_a &= !0x10;
                 self.push_output(0xFA);
             }
             CMD_ENABLE_SECONDARY => {
                 debug!("i8042: mouse/secondary enabled");
                 self.mouse_enabled = true;
+                self.port_a |= 0x10;
                 self.push_output(0xFA);
             }
             CMD_TEST_KEYBOARD => {
@@ -409,11 +419,7 @@ impl I8042Device {
                 self.push_output(0x55);
             }
             CMD_READ_PORT_A => {
-                if let Some(byte) = self.output_buffer.front().copied() {
-                    self.push_output(byte);
-                } else {
-                    self.push_output(0x00);
-                }
+                self.push_output(self.port_a);
             }
             CMD_READ_PORT_B => {
                 self.push_output(self.port_b);
@@ -560,6 +566,7 @@ mod tests {
             status: STATUS_SYSTEM_FLAG,
             output_buffer: VecDeque::new(),
             input_buffer: None,
+            port_a: 0x00,
             port_b: 0x20,
             keyboard_enabled: true,
             mouse_enabled: true,
@@ -599,6 +606,7 @@ mod tests {
 
         dev.write(0, OFFSET_COMMAND, &[CMD_DISABLE_KEYBOARD]);
         assert!(!dev.keyboard_enabled);
+        assert_eq!(dev.port_a & 0x01, 0);
 
         let mut data = [0u8];
         dev.read(0, OFFSET_DATA, &mut data);
@@ -606,6 +614,7 @@ mod tests {
 
         dev.write(0, OFFSET_COMMAND, &[CMD_ENABLE_KEYBOARD]);
         assert!(dev.keyboard_enabled);
+        assert_eq!(dev.port_a & 0x01, 0x01);
     }
 
     #[test]
@@ -614,9 +623,11 @@ mod tests {
 
         dev.write(0, OFFSET_COMMAND, &[CMD_DISABLE_SECONDARY]);
         assert!(!dev.mouse_enabled);
+        assert_eq!(dev.port_a & 0x10, 0);
 
         dev.write(0, OFFSET_COMMAND, &[CMD_ENABLE_SECONDARY]);
         assert!(dev.mouse_enabled);
+        assert_eq!(dev.port_a & 0x10, 0x10);
     }
 
     #[test]
@@ -632,7 +643,7 @@ mod tests {
     #[test]
     fn test_read_port_a() {
         let mut dev = make_device();
-        dev.push_output(0xAB);
+        dev.port_a = 0xAB;
 
         dev.write(0, OFFSET_COMMAND, &[CMD_READ_PORT_A]);
         let mut data = [0u8];
