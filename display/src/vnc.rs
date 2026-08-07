@@ -287,13 +287,44 @@ fn handle_client(
 
     info!("vnc: client authenticated and connected");
 
-    let fps = 15;
+    let fps = 1;
     let interval = Duration::from_millis(1000 / fps);
     let mut last_data: Option<Vec<u8>> = None;
 
     while running.load(Ordering::SeqCst) {
         let should_send = {
             let mut s = stream.lock().unwrap();
+
+            // Check for client input FIRST (before FBU to avoid blocking)
+            let fd = s.as_raw_fd();
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let polled = {
+                // SAFETY: fd is a valid file descriptor from a live VncStream.
+                // poll_fd is properly initialized with valid fields.
+                // The pointer is valid for reads of 1 element.
+                (unsafe { libc::poll(&mut poll_fd, 1, 0) }) > 0
+            };
+            if polled && (poll_fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "Client disconnected (poll hangup/error)",
+                ));
+            }
+            let readable = polled && (poll_fd.revents & libc::POLLIN) != 0;
+
+            if readable {
+                let mut reader = BufReader::new(&mut *s);
+                if let Err(e) =
+                    check_client_input(&mut reader, input_sender)
+                {
+                    warn!("vnc: input read error: {}", e);
+                }
+            }
+
             match surface.read_framebuffer() {
                 Some(current_data) => {
                     let has_change = match &last_data {
@@ -307,43 +338,38 @@ fn handle_client(
                     );
 
                     if has_change {
-                        if send_framebuffer_update(
-                            &mut *s,
-                            &current_data,
-                            surface.config().width,
-                            surface.config().height,
-                        )
-                        .is_err()
-                        {
-                            warn!("vnc: failed to send framebuffer update");
-                        } else {
-                            last_data = Some(current_data);
+                        // Check if socket is writable before sending FBU
+                        let mut poll_out = libc::pollfd {
+                            fd: s.as_raw_fd(),
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        let writable = {
+                            // SAFETY: fd is valid from live VncStream
+                            (unsafe { libc::poll(&mut poll_out, 1, 0) }) > 0
+                        } && (poll_out.revents & libc::POLLOUT) != 0;
+
+                        if writable {
+                            if send_framebuffer_update(
+                                &mut *s,
+                                &current_data,
+                                surface.config().width,
+                                surface.config().height,
+                            )
+                            .is_err()
+                            {
+                                warn!("vnc: failed to send framebuffer update, client disconnected");
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::BrokenPipe,
+                                    "Client disconnected",
+                                ));
+                            } else {
+                                last_data = Some(current_data);
+                            }
                         }
-                    }
-
-                // Check for client input using poll
-                let fd = s.as_raw_fd();
-                let mut poll_fd = libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let readable = {
-                    // SAFETY: fd is a valid file descriptor from a live VncStream.
-                    // poll_fd is properly initialized with valid fields.
-                    // The pointer is valid for reads of 1 element.
-                    (unsafe { libc::poll(&mut poll_fd, 1, 0) }) > 0
-                } && (poll_fd.revents & libc::POLLIN) != 0;
-
-                if readable {
-                    let mut reader = BufReader::new(&mut *s);
-                    if let Err(e) =
-                        check_client_input(&mut reader, input_sender)
-                    {
-                        warn!("vnc: input read error: {}", e);
+                        // If not writable, skip FBU this frame and try next iteration
                     }
                 }
-            }
                 None => {
                     debug!("vnc: read_framebuffer returned None");
                 }
@@ -365,7 +391,7 @@ fn handle_client(
 
 fn handshake<RW: Read + Write>(rw: &mut RW) -> Result<bool> {
     // Advertise RFB 3.8 for list-based security negotiation.
-    rw.write_all(b"RFB 003.089\n")?;
+    rw.write_all(b"RFB 003.008\n")?;
     rw.flush()?;
 
     let mut client_version = [0u8; 12];
@@ -536,16 +562,13 @@ fn check_client_input<R: Read>(
     reader: &mut BufReader<R>,
     input_sender: &mpsc::Sender<VncInputEvent>,
 ) -> Result<()> {
-    if reader.buffer().is_empty() {
-        return Ok(());
-    }
+    loop {
+        let mut msg_type = [0u8; 1];
+        if reader.read_exact(&mut msg_type).is_err() {
+            break;
+        }
 
-    let mut msg_type = [0u8; 1];
-    if reader.read_exact(&mut msg_type).is_err() {
-        return Ok(());
-    }
-
-    match msg_type[0] {
+        match msg_type[0] {
         0 => {
             let mut padding = [0u8; 3];
             let mut unused = [0u8; 4];
@@ -563,54 +586,17 @@ fn check_client_input<R: Read>(
         }
         1 => {
             let mut padding = [0u8; 3];
-            let mut size = [0u8; 8];
-            let mut fmt = [0u8; 20];
+            let mut data = [0u8; 4];
             if reader.read_exact(&mut padding).is_err()
-                || reader.read_exact(&mut size).is_err()
-                || reader.read_exact(&mut fmt).is_err()
+                || reader.read_exact(&mut data).is_err()
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete SetDesktopSize",
-                ));
-            }
-            debug!("vnc: client sent SetDesktopSize");
-        }
-        2 => {
-            let mut rest = [0u8; 7];
-            if reader.read_exact(&mut rest).is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete FramebufferUpdateRequest",
-                ));
-            }
-            let incremental = rest[0] != 0;
-            debug!("vnc: FramebufferUpdateRequest incremental={incremental}");
-        }
-        3 => {
-            let mut key_data = [0u8; 8];
-            if reader.read_exact(&mut key_data).is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete KeyEvent",
-                ));
-            }
-            let down = key_data[0] != 0;
-            let key = u32::from_be_bytes([key_data[4], key_data[5], key_data[6], key_data[7]]);
-
-            let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
-            debug!("vnc: key event keysym={key} down={down}");
-        }
-        4 => {
-            let mut data = [0u8; 7];
-            if reader.read_exact(&mut data).is_err() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Incomplete SetColorMapEntries",
                 ));
             }
             let n_entries = u16::from_be_bytes([data[2], data[3]]);
-            let first_idx = u16::from_be_bytes([data[4], data[5]]);
+            let first_idx = u16::from_be_bytes([data[0], data[1]]);
             let entry_size = 6 * n_entries as usize;
             let mut entries = vec![0u8; entry_size];
             if reader.read_exact(&mut entries).is_err() {
@@ -622,6 +608,34 @@ fn check_client_input<R: Read>(
             debug!(
                 "vnc: SetColorMapEntries first={first_idx} n={n_entries}"
             );
+        }
+        3 => {
+            let mut padding = [0u8; 1];
+            if reader.read_exact(&mut padding).is_err() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Incomplete FramebufferUpdateRequest",
+                ));
+            }
+            let inc = padding[0] != 0;
+            debug!("vnc: FramebufferUpdateRequest incremental={inc}");
+        }
+        4 => {
+            let mut padding = [0u8; 3];
+            let mut key_data = [0u8; 4];
+            if reader.read_exact(&mut padding).is_err()
+                || reader.read_exact(&mut key_data).is_err()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Incomplete KeyEvent",
+                ));
+            }
+            let down = padding[0] != 0;
+            let key = u32::from_be_bytes(key_data);
+
+            let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
+            debug!("vnc: key event keysym=0x{key:x} down={down}");
         }
         5 => {
             let mut pointer_data = [0u8; 4];
@@ -665,6 +679,7 @@ fn check_client_input<R: Read>(
         _ => {
             warn!("vnc: unknown message type {}", msg_type[0]);
         }
+    }
     }
 
     Ok(())

@@ -1176,6 +1176,9 @@ pub struct DeviceManager {
     #[cfg(feature = "fw_cfg")]
     vnc_bridge_handle: Option<std::thread::JoinHandle<()>>,
 
+    #[cfg(feature = "fw_cfg")]
+    i8042: Option<Arc<Mutex<devices::legacy::I8042Device>>>,
+
     #[cfg(feature = "ivshmem")]
     // ivshmem device
     ivshmem_device: Option<Arc<Mutex<devices::IvshmemDevice>>>,
@@ -1476,6 +1479,8 @@ impl DeviceManager {
             vnc_server_handle: None,
             #[cfg(feature = "fw_cfg")]
             vnc_bridge_handle: None,
+            #[cfg(feature = "fw_cfg")]
+            i8042: None,
             #[cfg(feature = "ivshmem")]
             ivshmem_device: None,
             _acpi_cpu_hotplug_controller: acpi_cpu_hotplug_controller,
@@ -1554,6 +1559,7 @@ impl DeviceManager {
                 self.reset_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
+                &*legacy_interrupt_manager,
             )?;
         }
 
@@ -1728,43 +1734,41 @@ impl DeviceManager {
         })?;
 
         // Spawn bridge thread to forward VNC input events to i8042
-        if let Some(input_channel) = self.input_channel.as_ref() {
-            let input_channel: Arc<Mutex<VecDeque<devices::legacy::InputEvent>>> =
-                Arc::clone(input_channel);
+        if let Some(i8042) = self.i8042.as_ref() {
+            let i8042: Arc<Mutex<devices::legacy::I8042Device>> = Arc::clone(i8042);
+            // Get IRQ for triggering after releasing i8042 lock
+            let irq = i8042.lock().unwrap().irq();
             let bridge_handle = std::thread::Builder::new()
                 .name("ch-vnc-bridge".to_string())
                 .spawn(move || {
                     for event in input_receiver.iter() {
-                        let i8042_event = match event {
+                        match event {
                             display::vnc::VncInputEvent::Keyboard { key, down } => {
-                                devices::legacy::InputEvent::Keyboard {
-                                    key,
-                                    pressed: down,
+                                info!("vnc-bridge: keyboard key=0x{key:x} down={down}");
+                                // Lock i8042, process event, then drop lock BEFORE triggering IRQ
+                                let need_irq = {
+                                    let mut dev = i8042.lock().unwrap();
+                                    dev.process_keyboard_event(key, down)
+                                };
+                                // Lock is now dropped, vCPU can read data port
+                                if need_irq {
+                                    if let Some(ref irq) = irq {
+                                        if let Err(e) = irq.trigger(0) {
+                                            warn!("vnc-bridge: failed to trigger IRQ: {e}");
+                                        }
+                                    }
                                 }
                             }
-                            display::vnc::VncInputEvent::MouseButton { button, down } => {
-                                let mut buttons = 0u8;
-                                if down {
-                                    buttons |= 1 << button;
-                                }
-                                devices::legacy::InputEvent::Mouse {
-                                    buttons,
-                                    dx: 0,
-                                    dy: 0,
-                                }
+                            display::vnc::VncInputEvent::MouseButton { .. } => {
+                                // Mouse not yet wired
                             }
-                            display::vnc::VncInputEvent::PointerMove { dx, dy } => {
-                                devices::legacy::InputEvent::Mouse {
-                                    buttons: 0,
-                                    dx,
-                                    dy,
-                                }
+                            display::vnc::VncInputEvent::PointerMove { .. } => {
+                                // Mouse not yet wired
                             }
                             display::vnc::VncInputEvent::PointerPosition { .. } => {
-                                continue;
+                                // Not used
                             }
-                        };
-                        input_channel.lock().unwrap().push_back(i8042_event);
+                        }
                     }
                 })
                 .map_err(|e| {
@@ -2196,7 +2200,11 @@ impl DeviceManager {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn add_legacy_devices(&mut self, reset_evt: EventFd) -> DeviceManagerResult<()> {
+    fn add_legacy_devices(
+        &mut self,
+        reset_evt: EventFd,
+        legacy_interrupt_manager: &dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>,
+    ) -> DeviceManagerResult<()> {
         let vcpus_kill_signalled = self
             .cpu_manager
             .lock()
@@ -2210,12 +2218,19 @@ impl DeviceManager {
             .vcpus_pause_signalled()
             .clone();
         // Add a shutdown device (i8042) with PS/2 keyboard/mouse support
+        // IRQ 1 is the standard PS/2 keyboard IRQ
+        let i8042_irq = legacy_interrupt_manager
+            .create_group(LegacyIrqGroupConfig {
+                irq: 1,
+            })
+            .ok();
         #[cfg(feature = "fw_cfg")]
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
             reset_evt.try_clone().unwrap(),
             vcpus_kill_signalled.clone(),
             vcpus_pause_signalled.clone(),
             self.input_channel.as_ref().map(Arc::clone),
+            i8042_irq,
         )));
         #[cfg(not(feature = "fw_cfg"))]
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
@@ -2223,7 +2238,15 @@ impl DeviceManager {
             vcpus_kill_signalled.clone(),
             vcpus_pause_signalled.clone(),
             None,
+            i8042_irq,
         )));
+
+        {
+            #[cfg(feature = "fw_cfg")]
+            {
+                self.i8042 = Some(Arc::clone(&i8042));
+            }
+        }
 
         self.bus_devices
             .push(Arc::clone(&i8042) as Arc<dyn BusDeviceSync>);
