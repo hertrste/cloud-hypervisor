@@ -541,6 +541,18 @@ impl I8042Device {
             } else if data == 0xED && self.keyboard_enabled {
                 // SET LED command - acknowledge, parameter follows
                 self.push_output(0xFA);
+            } else if data == 0xF4 {
+                // ENABLE typing - acknowledge and enable keyboard data
+                debug!("i8042: keyboard enabled (0xF4)");
+                self.keyboard_enabled = true;
+                self.port_a |= 0x01;
+                self.push_output(0xFA);
+            } else if data == 0xF5 {
+                // DISABLE typing (reset to defaults and disable) - acknowledge
+                debug!("i8042: keyboard disabled (0xF5)");
+                self.keyboard_enabled = false;
+                self.port_a &= !0x01;
+                self.push_output(0xFA);
             } else {
                 self.input_buffer = Some(data);
             }
@@ -703,6 +715,31 @@ mod tests {
         dev.write(0, OFFSET_COMMAND, &[CMD_ENABLE_KEYBOARD]);
         assert!(dev.keyboard_enabled);
         assert_eq!(dev.port_a & 0x01, 0x01);
+    }
+
+    #[test]
+    fn test_keyboard_enable_disable_data_port() {
+        // Test 0xF5 (DISABLE) and 0xF4 (ENABLE) written directly to data port.
+        // These are the commands the Linux atkbd driver sends during init:
+        // atkbd_deactivate() sends 0xF5, atkbd_activate() sends 0xF4.
+        let mut dev = make_device();
+
+        // 0xF5 = DISABLE typing (atkbd_deactivate)
+        dev.write(0, OFFSET_DATA, &[0xF5]);
+        assert!(!dev.keyboard_enabled);
+        assert_eq!(dev.port_a & 0x01, 0);
+
+        let mut data = [0u8];
+        dev.read(0, OFFSET_DATA, &mut data);
+        assert_eq!(data[0], 0xFA); // keyboard ACK
+
+        // 0xF4 = ENABLE typing (atkbd_activate)
+        dev.write(0, OFFSET_DATA, &[0xF4]);
+        assert!(dev.keyboard_enabled);
+        assert_eq!(dev.port_a & 0x01, 0x01);
+
+        dev.read(0, OFFSET_DATA, &mut data);
+        assert_eq!(data[0], 0xFA); // keyboard ACK
     }
 
     #[test]

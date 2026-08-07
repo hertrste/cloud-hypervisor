@@ -1,4 +1,4 @@
-use std::io::{BufReader, Read, Result, Write};
+use std::io::{Read, Result, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -317,10 +317,7 @@ fn handle_client(
             let readable = polled && (poll_fd.revents & libc::POLLIN) != 0;
 
             if readable {
-                let mut reader = BufReader::new(&mut *s);
-                if let Err(e) =
-                    check_client_input(&mut reader, input_sender)
-                {
+                if let Err(e) = check_client_input(&mut *s, input_sender) {
                     warn!("vnc: input read error: {}", e);
                 }
             }
@@ -559,7 +556,7 @@ fn send_framebuffer_update<W: Write>(
 }
 
 fn check_client_input<R: Read>(
-    reader: &mut BufReader<R>,
+    reader: &mut R,
     input_sender: &mpsc::Sender<VncInputEvent>,
 ) -> Result<()> {
     loop {
@@ -610,15 +607,23 @@ fn check_client_input<R: Read>(
             );
         }
         3 => {
-            let mut padding = [0u8; 1];
-            if reader.read_exact(&mut padding).is_err() {
+            let mut header = [0u8; 4];
+            if reader.read_exact(&mut header).is_err() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Incomplete FramebufferUpdateRequest",
                 ));
             }
-            let inc = padding[0] != 0;
-            debug!("vnc: FramebufferUpdateRequest incremental={inc}");
+            let inc = header[1] != 0;
+            let num_rects = u16::from_be_bytes([header[2], header[3]]) as usize;
+            debug!(
+                "vnc: FramebufferUpdateRequest incremental={inc} num_rects={num_rects}"
+            );
+            // Skip rectangle data if present (we send full screen updates)
+            if num_rects > 0 {
+                let mut rect_data = vec![0u8; num_rects * 12];
+                let _ = reader.read_exact(&mut rect_data);
+            }
         }
         4 => {
             let mut padding = [0u8; 3];
