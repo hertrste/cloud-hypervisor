@@ -287,9 +287,27 @@ fn handle_client(
 
     info!("vnc: client authenticated and connected");
 
-    let fb_interval = Duration::from_millis(1000); // 1 FPS for framebuffer updates
+    // Send initial framebuffer update immediately so the client knows the display is alive.
+    // Many VNC clients (e.g., TigerVNC) throttle keyboard/mouse input until they receive
+    // at least one FBU, assuming the display is frozen otherwise.
+    let mut last_data: Option<Vec<u8>> = {
+        let mut s = stream.lock().unwrap();
+        if let Some(init_data) = surface.read_framebuffer() {
+            if send_framebuffer_update(&mut *s, &init_data, surface.config().width, surface.config().height).is_ok() {
+                info!("vnc: sent initial framebuffer update");
+                Some(init_data)
+            } else {
+                warn!("vnc: failed to send initial framebuffer update");
+                None
+            }
+        } else {
+            warn!("vnc: read_framebuffer returned None during initial update");
+            None
+        }
+    };
+
+    let fb_interval = Duration::from_millis(40); // 25 FPS for framebuffer updates
     let input_interval = Duration::from_millis(100); // 10 Hz for input polling
-    let mut last_data: Option<Vec<u8>> = None;
 
     while running.load(Ordering::SeqCst) {
         let sleep_duration = {
