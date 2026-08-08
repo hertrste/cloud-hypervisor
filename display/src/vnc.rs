@@ -636,7 +636,7 @@ fn check_client_input<R: Read>(
                     "Incomplete KeyEvent",
                 ));
             }
-            let down = padding[0] != 0;
+            let down = padding[2] != 0;
             let key = u32::from_be_bytes(key_data);
 
             let _ = input_sender.send(VncInputEvent::Keyboard { key, down });

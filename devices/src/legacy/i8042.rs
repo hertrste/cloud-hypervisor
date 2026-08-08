@@ -81,146 +81,151 @@ struct KeyboardMap;
 impl KeyboardMap {
     /// Generate PS/2 Set 1 scan codes from an X11 keysym (US keyboard layout).
     /// Returns a Vec of bytes to send to the PS/2 data port.
+    ///
+    /// Returns (make_code, needs_e0_prefix). Keys in the dedicated arrow/navigation
+    /// cluster and KP_Enter/KP_Divide require the 0xE0 extension prefix.
     fn scan_codes(key: u32, pressed: bool) -> Vec<u8> {
-        let make_code = match key {
-            // Letters (lowercase X11 keysyms)
-            0x61 => 0x1E, // a
-            0x62 => 0x30, // b
-            0x63 => 0x2E, // c
-            0x64 => 0x20, // d
-            0x65 => 0x12, // e
-            0x66 => 0x21, // f
-            0x67 => 0x22, // g
-            0x68 => 0x23, // h
-            0x69 => 0x17, // i
-            0x6A => 0x24, // j
-            0x6B => 0x25, // k
-            0x6C => 0x26, // l
-            0x6D => 0x32, // m
-            0x6E => 0x31, // n
-            0x6F => 0x18, // o
-            0x70 => 0x19, // p
-            0x71 => 0x10, // q
-            0x72 => 0x13, // r
-            0x73 => 0x1F, // s
-            0x74 => 0x14, // t
-            0x75 => 0x16, // u
-            0x76 => 0x2F, // v
-            0x77 => 0x11, // w
-            0x78 => 0x2D, // x
-            0x79 => 0x15, // y
-            0x7A => 0x2C, // z
+        let (make_code, e0) = match key {
+            // Letters (lowercase X11 keysyms) -> PS/2 Set 1
+            0x61 => (0x1E, false), // a
+            0x62 => (0x30, false), // b
+            0x63 => (0x2E, false), // c
+            0x64 => (0x20, false), // d
+            0x65 => (0x12, false), // e
+            0x66 => (0x21, false), // f
+            0x67 => (0x22, false), // g
+            0x68 => (0x23, false), // h
+            0x69 => (0x17, false), // i
+            0x6A => (0x24, false), // j
+            0x6B => (0x25, false), // k
+            0x6C => (0x26, false), // l
+            0x6D => (0x32, false), // m
+            0x6E => (0x31, false), // n
+            0x6F => (0x18, false), // o
+            0x70 => (0x19, false), // p
+            0x71 => (0x10, false), // q
+            0x72 => (0x13, false), // r
+            0x73 => (0x1F, false), // s
+            0x74 => (0x14, false), // t
+            0x75 => (0x16, false), // u
+            0x76 => (0x2F, false), // v
+            0x77 => (0x11, false), // w
+            0x78 => (0x2D, false), // x
+            0x79 => (0x15, false), // y
+            0x7A => (0x2C, false), // z
 
-            // Uppercase letters (same scan codes, shift handled by OS)
-            0x41 => 0x1E, // A
-            0x42 => 0x30, // B
-            0x43 => 0x2E, // C
-            0x44 => 0x20, // D
-            0x45 => 0x12, // E
-            0x46 => 0x21, // F
-            0x47 => 0x22, // G
-            0x48 => 0x23, // H
-            0x49 => 0x17, // I
-            0x4A => 0x24, // J
-            0x4B => 0x25, // K
-            0x4C => 0x26, // L
-            0x4D => 0x32, // M
-            0x4E => 0x31, // N
-            0x4F => 0x18, // O
-            0x50 => 0x19, // P
-            0x51 => 0x10, // Q
-            0x52 => 0x13, // R
-            0x53 => 0x1F, // S
-            0x54 => 0x14, // T
-            0x55 => 0x16, // U
-            0x56 => 0x2F, // V
-            0x57 => 0x11, // W
-            0x58 => 0x2D, // X
-            0x59 => 0x15, // Y
-            0x5A => 0x2C, // Z
+            // Uppercase letters (same scan codes, shift handled by guest OS)
+            0x41 => (0x1E, false), // A
+            0x42 => (0x30, false), // B
+            0x43 => (0x2E, false), // C
+            0x44 => (0x20, false), // D
+            0x45 => (0x12, false), // E
+            0x46 => (0x21, false), // F
+            0x47 => (0x22, false), // G
+            0x48 => (0x23, false), // H
+            0x49 => (0x17, false), // I
+            0x4A => (0x24, false), // J
+            0x4B => (0x25, false), // K
+            0x4C => (0x26, false), // L
+            0x4D => (0x32, false), // M
+            0x4E => (0x31, false), // N
+            0x4F => (0x18, false), // O
+            0x50 => (0x19, false), // P
+            0x51 => (0x10, false), // Q
+            0x52 => (0x13, false), // R
+            0x53 => (0x1F, false), // S
+            0x54 => (0x14, false), // T
+            0x55 => (0x16, false), // U
+            0x56 => (0x2F, false), // V
+            0x57 => (0x11, false), // W
+            0x58 => (0x2D, false), // X
+            0x59 => (0x15, false), // Y
+            0x5A => (0x2C, false), // Z
 
             // Digits
-            0x30 => 0x02, // 0
-            0x31 => 0x03, // 1
-            0x32 => 0x04, // 2
-            0x33 => 0x05, // 3
-            0x34 => 0x06, // 4
-            0x35 => 0x07, // 5
-            0x36 => 0x08, // 6
-            0x37 => 0x09, // 7
-            0x38 => 0x0A, // 8
-            0x39 => 0x0B, // 9
+            0x30 => (0x0B, false), // 0
+            0x31 => (0x02, false), // 1
+            0x32 => (0x03, false), // 2
+            0x33 => (0x04, false), // 3
+            0x34 => (0x05, false), // 4
+            0x35 => (0x06, false), // 5
+            0x36 => (0x07, false), // 6
+            0x37 => (0x08, false), // 7
+            0x38 => (0x09, false), // 8
+            0x39 => (0x0A, false), // 9
 
             // Punctuation / symbols
-            0x20 => 0x29, // Space
-            0x60 => 0x05, // Grave (`)
-            0x2D => 0x0C, // Minus (-)
-            0x3D => 0x0E, // Equals (=)
-            0x5B => 0x1A, // Left Bracket ([)
-            0x5D => 0x1B, // Right Bracket (])
-            0x5C => 0x2B, // Backslash (\)
-            0x3B => 0x28, // Semicolon (;)
-            0x27 => 0x27, // Quote (')
-            0x2C => 0x33, // Comma (,)
-            0x2E => 0x34, // Period (.)
-            0x2F => 0x35, // Slash (/)
+            0x20 => (0x39, false), // Space
+            0x60 => (0x29, false), // Grave (`)
+            0x2D => (0x0C, false), // Minus (-)
+            0x3D => (0x0D, false), // Equals (=)
+            0x5B => (0x1A, false), // Left Bracket ([)
+            0x5D => (0x1B, false), // Right Bracket (])
+            0x5C => (0x2B, false), // Backslash (\)
+            0x3B => (0x27, false), // Semicolon (;)
+            0x27 => (0x28, false), // Quote (')
+            0x2C => (0x33, false), // Comma (,)
+            0x2E => (0x34, false), // Period (.)
+            0x2F => (0x35, false), // Slash (/)
 
             // Control keys
-            0xFF1B => 0x01, // Escape
-            0xFF09 => 0x0F, // Tab
-            0xFF0D => 0x1C, // Return/Enter
-            0xFFE1 => 0x2A, // Shift_L
-            0xFFE2 => 0x36, // Shift_R
-            0xFFE3 => 0x1D, // Control_L
-            0xFFE4 => 0x1D, // Control_R
-            0xFFE9 => 0x38, // Alt_L
-            0xFFEA => 0xB8, // Alt_R (AltGr)
-            0xFFE5 => 0x3A, // Caps_Lock
-            0xFF08 => 0x0E, // BackSpace
-            0xFFFF => 0x53, // Delete
-            0xFF67 => 0x53, // Delete (alternate)
-            0xFF50 => 0x47, // Home
-            0xFF57 => 0x4F, // End
-            0xFF55 => 0x49, // Prior/PageUp
-            0xFF56 => 0x51, // Next/PageDown
-            0xFF52 => 0x48, // Up
-            0xFF54 => 0x50, // Down
-            0xFF51 => 0x4B, // Left
-            0xFF53 => 0x4D, // Right
-            0xFF63 => 0x52, // Insert
+            0xFF1B => (0x01, false), // Escape
+            0xFF09 => (0x0F, false), // Tab
+            0xFF0D => (0x1C, false), // Return/Enter
+            0xFFE1 => (0x2A, false), // Shift_L
+            0xFFE2 => (0x36, false), // Shift_R
+            0xFFE3 => (0x1D, false), // Control_L
+            0xFFE4 => (0x1D, false), // Control_R
+            0xFFE9 => (0x38, false), // Alt_L
+            0xFFEA => (0xB8, false), // Alt_R (AltGr)
+            0xFFE5 => (0x3A, false), // Caps_Lock
+            0xFF08 => (0x0E, false), // BackSpace
+
+            // Dedicated navigation cluster (E0-prefixed in Set 1)
+            0xFFFF => (0x53, true), // Delete
+            0xFF67 => (0x53, true), // Delete (alternate)
+            0xFF50 => (0x47, true), // Home
+            0xFF57 => (0x4F, true), // End
+            0xFF55 => (0x49, true), // Prior/PageUp
+            0xFF56 => (0x51, true), // Next/PageDown
+            0xFF52 => (0x48, true), // Up
+            0xFF54 => (0x50, true), // Down
+            0xFF51 => (0x4B, true), // Left
+            0xFF53 => (0x4D, true), // Right
+            0xFF63 => (0x52, true), // Insert
 
             // F keys
-            0xFFBE => 0x3B, // F1
-            0xFFBF => 0x3C, // F2
-            0xFFC0 => 0x3D, // F3
-            0xFFC1 => 0x3E, // F4
-            0xFFC2 => 0x3F, // F5
-            0xFFC3 => 0x40, // F6
-            0xFFC4 => 0x41, // F7
-            0xFFC5 => 0x42, // F8
-            0xFFC6 => 0x43, // F9
-            0xFFC7 => 0x44, // F10
-            0xFFC8 => 0x45, // F11
-            0xFFC9 => 0x46, // F12
+            0xFFBE => (0x3B, false), // F1
+            0xFFBF => (0x3C, false), // F2
+            0xFFC0 => (0x3D, false), // F3
+            0xFFC1 => (0x3E, false), // F4
+            0xFFC2 => (0x3F, false), // F5
+            0xFFC3 => (0x40, false), // F6
+            0xFFC4 => (0x41, false), // F7
+            0xFFC5 => (0x42, false), // F8
+            0xFFC6 => (0x43, false), // F9
+            0xFFC7 => (0x44, false), // F10
+            0xFFC8 => (0x45, false), // F11
+            0xFFC9 => (0x46, false), // F12
 
-            // Numpad
-            0xFF90 => 0x70, // KP_0
-            0xFF91 => 0x69, // KP_1
-            0xFF92 => 0x72, // KP_2
-            0xFF93 => 0x7A, // KP_3
-            0xFF94 => 0x6B, // KP_4
-            0xFF95 => 0x73, // KP_5
-            0xFF96 => 0x74, // KP_6
-            0xFF97 => 0x71, // KP_7
-            0xFF98 => 0x79, // KP_8
-            0xFF99 => 0x7B, // KP_9
-            0xFFAE => 0x71, // KP_Decimal
-            0xFF8D => 0x1C, // KP_Enter
-            0xFF6B => 0x4E, // KP_Add
-            0xFF6D => 0x4A, // KP_Subtract
-            0xFF6A => 0x37, // KP_Multiply
-            0xFF6F => 0x4C, // KP_Divide
-            _ => 0x00,       // Unknown key
+            // Numpad (Set 1 codes, share with navigation keys)
+            0xFF90 => (0x52, false), // KP_0
+            0xFF91 => (0x4F, false), // KP_1
+            0xFF92 => (0x50, false), // KP_2
+            0xFF93 => (0x51, false), // KP_3
+            0xFF94 => (0x4B, false), // KP_4
+            0xFF95 => (0x4C, false), // KP_5
+            0xFF96 => (0x4D, false), // KP_6
+            0xFF97 => (0x47, false), // KP_7
+            0xFF98 => (0x48, false), // KP_8
+            0xFF99 => (0x49, false), // KP_9
+            0xFFAE => (0x53, false), // KP_Decimal
+            0xFF8D => (0x1C, true), // KP_Enter (E0-prefixed)
+            0xFF6B => (0x4E, false), // KP_Add
+            0xFF6D => (0x4A, false), // KP_Subtract
+            0xFF6A => (0x37, false), // KP_Multiply
+            0xFF6F => (0x35, true), // KP_Divide (E0-prefixed)
+            _ => (0x00, false),      // Unknown key
         };
 
         if make_code == 0 {
@@ -228,9 +233,17 @@ impl KeyboardMap {
         }
 
         if pressed {
-            vec![make_code]
+            if e0 {
+                vec![0xE0, make_code]
+            } else {
+                vec![make_code]
+            }
         } else {
-            vec![0xF0, make_code]
+            if e0 {
+                vec![0xE0, 0xF0, make_code]
+            } else {
+                vec![0xF0, make_code]
+            }
         }
     }
 }
