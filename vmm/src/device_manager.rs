@@ -1745,6 +1745,11 @@ impl DeviceManager {
                         match event {
                             display::vnc::VncInputEvent::Keyboard { key, down } => {
                                 info!("vnc-bridge: keyboard key=0x{key:x} down={down}");
+                                // Backpressure: wait if PS/2 output buffer is nearly full
+                                // so the guest has time to read scan codes via the data port
+                                if i8042.lock().unwrap().output_buffer_near_full() {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
                                 // Lock i8042, process event, then drop lock BEFORE triggering IRQ
                                 let need_irq = {
                                     let mut dev = i8042.lock().unwrap();
@@ -1755,7 +1760,11 @@ impl DeviceManager {
                                     if let Some(ref irq) = irq {
                                         if let Err(e) = irq.trigger(0) {
                                             warn!("vnc-bridge: failed to trigger IRQ: {e}");
+                                        } else {
+                                            info!("vnc-bridge: IRQ triggered for keyboard event");
                                         }
+                                    } else {
+                                        info!("vnc-bridge: no IRQ available for keyboard event");
                                     }
                                 }
                             }

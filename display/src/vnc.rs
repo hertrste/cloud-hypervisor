@@ -287,12 +287,12 @@ fn handle_client(
 
     info!("vnc: client authenticated and connected");
 
-    let fps = 1;
-    let interval = Duration::from_millis(1000 / fps);
+    let fb_interval = Duration::from_millis(1000); // 1 FPS for framebuffer updates
+    let input_interval = Duration::from_millis(100); // 10 Hz for input polling
     let mut last_data: Option<Vec<u8>> = None;
 
     while running.load(Ordering::SeqCst) {
-        let should_send = {
+        let sleep_duration = {
             let mut s = stream.lock().unwrap();
 
             // Check for client input FIRST (before FBU to avoid blocking)
@@ -328,6 +328,7 @@ fn handle_client(
                 let _ = s.set_read_timeout(None);
             }
 
+            let mut fb_sent = false;
             match surface.read_framebuffer() {
                 Some(current_data) => {
                     let has_change = match &last_data {
@@ -368,21 +369,23 @@ fn handle_client(
                                 ));
                             } else {
                                 last_data = Some(current_data);
+                                fb_sent = true;
                             }
                         }
-                        // If not writable, skip FBU this frame and try next iteration
                     }
                 }
                 None => {
                     debug!("vnc: read_framebuffer returned None");
                 }
             }
-            true
+            if fb_sent {
+                fb_interval
+            } else {
+                input_interval
+            }
         }; // drop lock
 
-        if should_send {
-            thread::sleep(interval);
-        }
+        thread::sleep(sleep_duration);
     }
 
     if let Some(cb) = on_disconnect {

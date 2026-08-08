@@ -24,6 +24,9 @@ const OFFSET_COMMAND: u64 = 4;
 // PS/2 command codes
 const CMD_READ_PORT_A: u8 = 0x20;
 const CMD_READ_PORT_B: u8 = 0x21;
+
+// CTR (Controller Configuration Register) bits
+const CTR_XLATE: u8 = 1 << 6; // Scancode translation enable (Set 2 → Set 1)
 const CMD_WRITE_PORT_A: u8 = 0x60;
 const CMD_TEST_CONTROLLER: u8 = 0xAA;
 const CMD_DISABLE_SECONDARY: u8 = 0xA7;
@@ -275,6 +278,16 @@ pub struct I8042Device {
     // Port B register value
     port_b: u8,
 
+    // Controller configuration register (CTR)
+    // Bit 1: KBD INT (keyboard interrupt enable)
+    // Bit 2: SYS FLAG (system flag)
+    // Bit 3: KBD DIS (keyboard disable)
+    // Bit 4: AUX DIS (auxiliary disable)
+    // Bit 5: AUX INT (auxiliary interrupt enable)
+    // Bit 6: XLATE (scancode translation: 1 = Set 2→Set 1, 0 = raw Set 2)
+    // Bit 7: CPU INT (CPU interrupt enable)
+    ctr: u8,
+
     // Control register (bit 6 = keylock, must be 0 for atkbd to load)
     control_reg: u8,
 
@@ -317,6 +330,7 @@ impl I8042Device {
             input_buffer: None,
             port_a: 0x00,
             port_b: 0x23,
+            ctr: CTR_XLATE, // Translated mode: i8042 converts Set 2 → Set 1
             control_reg: 0x00,
             keyboard_enabled: true,
             mouse_enabled: true,
@@ -329,6 +343,13 @@ impl I8042Device {
     /// Get a clone of the IRQ source group, if present.
     pub fn irq(&self) -> Option<Arc<dyn InterruptSourceGroup>> {
         self.irq.as_ref().map(Arc::clone)
+    }
+
+    /// Check whether the output buffer is nearly full.
+    /// Returns true when the buffer has fewer than 4 free slots,
+    /// giving the caller a chance to back off before events are dropped.
+    pub fn output_buffer_near_full(&self) -> bool {
+        self.output_buffer.len() >= MAX_DATA_BUFFER - 4
     }
 
     /// Push a byte to the output buffer and trigger interrupt if data was added.
@@ -483,7 +504,11 @@ impl I8042Device {
                 self.push_output(0x55);
             }
             CMD_READ_PORT_A => {
-                self.push_output(self.port_a);
+                // Linux uses 0x20 to read the CTR during i8042 initialization.
+                // It checks the XLATE bit (0x40) to determine whether the controller
+                // translates Set 2 → Set 1 scancodes. If XLATE is clear, atkbd uses
+                // the Set 2 keycode table, causing Set 1 scancodes to be misinterpreted.
+                self.push_output(self.ctr);
             }
             CMD_WRITE_PORT_A => {
                 self.pending_command = Some(cmd);
@@ -684,6 +709,7 @@ mod tests {
             input_buffer: None,
             port_a: 0x00,
             port_b: 0x20,
+            ctr: CTR_XLATE,
             control_reg: 0x00,
             keyboard_enabled: true,
             mouse_enabled: true,
@@ -786,7 +812,7 @@ mod tests {
     #[test]
     fn test_read_port_a() {
         let mut dev = make_device();
-        dev.port_a = 0xAB;
+        dev.ctr = 0xAB;
 
         dev.write(0, OFFSET_COMMAND, &[CMD_READ_PORT_A]);
         let mut data = [0u8];
