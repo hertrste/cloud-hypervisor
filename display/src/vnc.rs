@@ -317,9 +317,15 @@ fn handle_client(
             let readable = polled && (poll_fd.revents & libc::POLLIN) != 0;
 
             if readable {
+                // Temporarily set blocking so read() doesn't fail with WouldBlock.
+                // Use a short timeout so we don't hang if the client stalls.
+                let _ = s.set_nonblocking(false);
+                let _ = s.set_read_timeout(Some(Duration::from_millis(10)));
                 if let Err(e) = check_client_input(&mut *s, input_sender) {
                     warn!("vnc: input read error: {}", e);
                 }
+                let _ = s.set_nonblocking(true);
+                let _ = s.set_read_timeout(None);
             }
 
             match surface.read_framebuffer() {
@@ -574,10 +580,7 @@ fn check_client_input<R: Read>(
                 || reader.read_exact(&mut unused).is_err()
                 || reader.read_exact(&mut format).is_err()
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete SetPixelFormat",
-                ));
+                break;
             }
             debug!("vnc: client sent SetPixelFormat");
         }
@@ -587,32 +590,38 @@ fn check_client_input<R: Read>(
             if reader.read_exact(&mut padding).is_err()
                 || reader.read_exact(&mut data).is_err()
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete SetColorMapEntries",
-                ));
+                break;
             }
             let n_entries = u16::from_be_bytes([data[2], data[3]]);
             let first_idx = u16::from_be_bytes([data[0], data[1]]);
             let entry_size = 6 * n_entries as usize;
             let mut entries = vec![0u8; entry_size];
             if reader.read_exact(&mut entries).is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete SetColorMapEntries",
-                ));
+                break;
             }
             debug!(
                 "vnc: SetColorMapEntries first={first_idx} n={n_entries}"
             );
         }
+        2 => {
+            let mut padding = [0u8; 3];
+            let mut num_encodings = [0u8; 2];
+            if reader.read_exact(&mut padding).is_err()
+                || reader.read_exact(&mut num_encodings).is_err()
+            {
+                break;
+            }
+            let count = u16::from_be_bytes(num_encodings) as usize;
+            let mut encodings = vec![0u8; count * 4];
+            if reader.read_exact(&mut encodings).is_err() {
+                break;
+            }
+            debug!("vnc: SetEncodings count={count}");
+        }
         3 => {
             let mut header = [0u8; 4];
             if reader.read_exact(&mut header).is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete FramebufferUpdateRequest",
-                ));
+                break;
             }
             let inc = header[1] != 0;
             let num_rects = u16::from_be_bytes([header[2], header[3]]) as usize;
@@ -631,12 +640,9 @@ fn check_client_input<R: Read>(
             if reader.read_exact(&mut padding).is_err()
                 || reader.read_exact(&mut key_data).is_err()
             {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete KeyEvent",
-                ));
+                break;
             }
-            let down = padding[2] != 0;
+            let down = padding[0] != 0;
             let key = u32::from_be_bytes(key_data);
 
             let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
@@ -645,18 +651,12 @@ fn check_client_input<R: Read>(
         5 => {
             let mut pointer_data = [0u8; 4];
             if reader.read_exact(&mut pointer_data).is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete PointerEvent",
-                ));
+                break;
             }
             let mask = pointer_data[0];
             let mut pos = [0u8; 4];
             if reader.read_exact(&mut pos).is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Incomplete PointerEvent position",
-                ));
+                break;
             }
             let x = u16::from_be_bytes([pos[0], pos[1]]) as u32;
             let y = u16::from_be_bytes([pos[2], pos[3]]) as u32;
@@ -681,8 +681,22 @@ fn check_client_input<R: Read>(
 
             debug!("vnc: pointer event mask={mask} x={x} y={y}");
         }
+        6 => {
+            let mut header = [0u8; 4];
+            if reader.read_exact(&mut header).is_err() {
+                break;
+            }
+            let length = u32::from_be_bytes(header);
+            if length > 0 {
+                let mut text = vec![0u8; length as usize];
+                if reader.read_exact(&mut text).is_err() {
+                    break;
+                }
+                debug!("vnc: ClientCutText length={length}");
+            }
+        }
         _ => {
-            warn!("vnc: unknown message type {}", msg_type[0]);
+            debug!("vnc: unknown message type {}", msg_type[0]);
         }
     }
     }
@@ -741,7 +755,7 @@ mod tests {
         let result = handshake(&mut sock);
         assert!(result.is_ok(), "handshake should succeed for RFB 3.8");
         assert!(result.unwrap(), "should negotiate RFB 3.8");
-        assert!(sock.written_data().starts_with(b"RFB 003.089\n"));
+        assert!(sock.written_data().starts_with(b"RFB 003.008\n"));
     }
 
     #[test]
@@ -756,13 +770,12 @@ mod tests {
     #[test]
     fn test_rfb38_security_noauth() {
         let mut sock = MockSocket::new();
-        sock.queue_read_data(&[0, 0, 0, 2]);
-        security(&mut sock, true).expect("security should succeed for type 2");
+        sock.queue_read_data(&[1]);
+        security(&mut sock, true).expect("security should succeed for type 1 (None)");
         let w = sock.written_data();
-        // RFB 3.8: 1-byte count + 4-byte type + 4-byte result
-        assert_eq!(&w[0..1], &[1]); // count=1 (1 byte!)
-        assert_eq!(&w[1..5], &[0, 0, 0, 2]); // type=NoAuth
-        assert_eq!(&w[5..9], &[0, 0, 0, 0]); // OK
+        assert_eq!(&w[0..1], &[1]); // count=1
+        assert_eq!(&w[1..2], &[1]); // type=None (1 byte in RFB 3.8)
+        assert_eq!(&w[2..6], &[0, 0, 0, 0]); // OK (4-byte result)
     }
 
     #[test]
@@ -773,23 +786,23 @@ mod tests {
         let use_rfb38 = handshake(&mut sock).expect("handshake failed");
         assert!(use_rfb38);
 
-        sock.queue_read_data(&[0, 0, 0, 2]);
+        sock.queue_read_data(&[1]);
         security(&mut sock, use_rfb38).expect("security failed");
 
         sock.queue_read_data(&[]);
         server_init(&mut sock, 800, 600).expect("server_init failed");
 
-        sock.queue_read_data(&[0, 0, 0, 0]);
+        sock.queue_read_data(&[1]);
         client_init(&mut sock).expect("client_init failed");
 
         let w = sock.written_data();
-        assert!(w.starts_with(b"RFB 003.089\n"));
-        // Security types start at offset 12 (after "RFB 003.089\n")
-        assert_eq!(&w[12..13], &[1]); // count=1 (1 byte in RFB 3.8)
-        assert_eq!(&w[13..17], &[0, 0, 0, 2]); // type=NoAuth
-        assert_eq!(&w[17..21], &[0, 0, 0, 0]); // OK
-        // Server init starts at offset 21
-        assert_eq!(&w[21..25], &(800u32).to_be_bytes());
-        assert_eq!(&w[25..29], &(600u32).to_be_bytes());
+        assert!(w.starts_with(b"RFB 003.008\n"));
+        // Security types start at offset 12 (after "RFB 003.008\n")
+        assert_eq!(&w[12..13], &[1]); // count=1
+        assert_eq!(&w[13..14], &[1]); // type=None
+        assert_eq!(&w[14..18], &[0, 0, 0, 0]); // OK
+        // Server init starts at offset 18
+        assert_eq!(&w[18..20], &(800u16).to_be_bytes());
+        assert_eq!(&w[20..22], &(600u16).to_be_bytes());
     }
 }

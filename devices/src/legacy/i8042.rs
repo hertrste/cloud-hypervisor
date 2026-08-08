@@ -358,9 +358,14 @@ impl I8042Device {
         }
         let scan_codes = KeyboardMap::scan_codes(key, pressed);
         if !scan_codes.is_empty() {
+            info!(
+                "i8042: keysym=0x{:x} pressed={} -> scan_codes=[{:02x?}]",
+                key, pressed, scan_codes
+            );
             self.push_output_bytes_no_irq(&scan_codes);
             true
         } else {
+            info!("i8042: unknown keysym=0x{:x} pressed={}", key, pressed);
             false
         }
     }
