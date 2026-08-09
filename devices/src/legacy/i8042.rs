@@ -4,10 +4,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use log::{debug, error, info, warn};
 use vm_device::BusDevice;
@@ -293,6 +294,8 @@ pub struct I8042Device {
 
     // Keyboard state
     keyboard_enabled: bool,
+    // Tracks currently pressed keys + last event time to filter VNC autorepeat and recover from missed up events
+    pressed_keys: HashMap<u32, (bool, Instant)>,
     // Mouse (secondary) state
     mouse_enabled: bool,
 
@@ -333,6 +336,7 @@ impl I8042Device {
             ctr: CTR_XLATE, // Translated mode: i8042 converts Set 2 → Set 1
             control_reg: 0x00,
             keyboard_enabled: true,
+            pressed_keys: HashMap::new(),
             mouse_enabled: true,
             pending_command: None,
             input_channel,
@@ -377,8 +381,19 @@ impl I8042Device {
         if !self.keyboard_enabled {
             return false;
         }
+
+        // Strict state machine: reject duplicate down/up events.
+        // TigerVNC resends "down" events on autorepeat; we only want one down + one up.
+        if let Some(currently_down) = self.pressed_keys.get(&key).map(|&(down, _)| down) {
+            if currently_down == pressed {
+                info!("i8042: filtering duplicate keysym=0x{:x} pressed={}", key, pressed);
+                return false;
+            }
+        }
+
         let scan_codes = KeyboardMap::scan_codes(key, pressed);
         if !scan_codes.is_empty() {
+            self.pressed_keys.insert(key, (pressed, Instant::now()));
             info!(
                 "i8042: keysym=0x{:x} pressed={} -> scan_codes=[{:02x?}]",
                 key, pressed, scan_codes
@@ -712,6 +727,7 @@ mod tests {
             ctr: CTR_XLATE,
             control_reg: 0x00,
             keyboard_enabled: true,
+            pressed_keys: HashMap::new(),
             mouse_enabled: true,
             pending_command: None,
             input_channel: None,

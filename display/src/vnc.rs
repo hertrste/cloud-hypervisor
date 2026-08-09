@@ -283,6 +283,7 @@ fn handle_client(
     {
         let s = stream.lock().unwrap();
         s.set_nonblocking(true)?;
+        s.set_read_timeout(None).ok();
     }
 
     info!("vnc: client authenticated and connected");
@@ -335,15 +336,11 @@ fn handle_client(
             let readable = polled && (poll_fd.revents & libc::POLLIN) != 0;
 
             if readable {
-                // Temporarily set blocking so read() doesn't fail with WouldBlock.
-                // Use a short timeout so we don't hang if the client stalls.
-                let _ = s.set_nonblocking(false);
-                let _ = s.set_read_timeout(Some(Duration::from_millis(10)));
+                // Keep non-blocking — check_client_input stops on WouldBlock/EAGAIN.
+                info!("vnc: socket readable, draining input");
                 if let Err(e) = check_client_input(&mut *s, input_sender) {
                     warn!("vnc: input read error: {}", e);
                 }
-                let _ = s.set_nonblocking(true);
-                let _ = s.set_read_timeout(None);
             }
 
             let mut fb_sent = false;
@@ -593,133 +590,148 @@ fn check_client_input<R: Read>(
         }
 
         match msg_type[0] {
-        0 => {
-            let mut padding = [0u8; 3];
-            let mut unused = [0u8; 4];
-            let mut format = [0u8; 16];
-            if reader.read_exact(&mut padding).is_err()
-                || reader.read_exact(&mut unused).is_err()
-                || reader.read_exact(&mut format).is_err()
-            {
-                break;
-            }
-            debug!("vnc: client sent SetPixelFormat");
-        }
-        1 => {
-            let mut padding = [0u8; 3];
-            let mut data = [0u8; 4];
-            if reader.read_exact(&mut padding).is_err()
-                || reader.read_exact(&mut data).is_err()
-            {
-                break;
-            }
-            let n_entries = u16::from_be_bytes([data[2], data[3]]);
-            let first_idx = u16::from_be_bytes([data[0], data[1]]);
-            let entry_size = 6 * n_entries as usize;
-            let mut entries = vec![0u8; entry_size];
-            if reader.read_exact(&mut entries).is_err() {
-                break;
-            }
-            debug!(
-                "vnc: SetColorMapEntries first={first_idx} n={n_entries}"
-            );
-        }
-        2 => {
-            let mut padding = [0u8; 3];
-            let mut num_encodings = [0u8; 2];
-            if reader.read_exact(&mut padding).is_err()
-                || reader.read_exact(&mut num_encodings).is_err()
-            {
-                break;
-            }
-            let count = u16::from_be_bytes(num_encodings) as usize;
-            let mut encodings = vec![0u8; count * 4];
-            if reader.read_exact(&mut encodings).is_err() {
-                break;
-            }
-            debug!("vnc: SetEncodings count={count}");
-        }
-        3 => {
-            let mut header = [0u8; 4];
-            if reader.read_exact(&mut header).is_err() {
-                break;
-            }
-            let inc = header[1] != 0;
-            let num_rects = u16::from_be_bytes([header[2], header[3]]) as usize;
-            debug!(
-                "vnc: FramebufferUpdateRequest incremental={inc} num_rects={num_rects}"
-            );
-            // Skip rectangle data if present (we send full screen updates)
-            if num_rects > 0 {
-                let mut rect_data = vec![0u8; num_rects * 12];
-                let _ = reader.read_exact(&mut rect_data);
-            }
-        }
-        4 => {
-            let mut padding = [0u8; 3];
-            let mut key_data = [0u8; 4];
-            if reader.read_exact(&mut padding).is_err()
-                || reader.read_exact(&mut key_data).is_err()
-            {
-                break;
-            }
-            let down = padding[0] != 0;
-            let key = u32::from_be_bytes(key_data);
-
-            let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
-            debug!("vnc: key event keysym=0x{key:x} down={down}");
-        }
-        5 => {
-            let mut pointer_data = [0u8; 4];
-            if reader.read_exact(&mut pointer_data).is_err() {
-                break;
-            }
-            let mask = pointer_data[0];
-            let mut pos = [0u8; 4];
-            if reader.read_exact(&mut pos).is_err() {
-                break;
-            }
-            let x = u16::from_be_bytes([pos[0], pos[1]]) as u32;
-            let y = u16::from_be_bytes([pos[2], pos[3]]) as u32;
-
-            let left_down = (mask & 1) != 0;
-            let middle_down = (mask & 2) != 0;
-            let right_down = (mask & 4) != 0;
-
-            let _ = input_sender.send(VncInputEvent::MouseButton {
-                button: 0,
-                down: left_down,
-            });
-            let _ = input_sender.send(VncInputEvent::MouseButton {
-                button: 1,
-                down: middle_down,
-            });
-            let _ = input_sender.send(VncInputEvent::MouseButton {
-                button: 2,
-                down: right_down,
-            });
-            let _ = input_sender.send(VncInputEvent::PointerPosition { x, y });
-
-            debug!("vnc: pointer event mask={mask} x={x} y={y}");
-        }
-        6 => {
-            let mut header = [0u8; 4];
-            if reader.read_exact(&mut header).is_err() {
-                break;
-            }
-            let length = u32::from_be_bytes(header);
-            if length > 0 {
-                let mut text = vec![0u8; length as usize];
-                if reader.read_exact(&mut text).is_err() {
+            0 => {
+                let mut rest = [0u8; 23];
+                if reader.read_exact(&mut rest).is_err() {
                     break;
                 }
-                debug!("vnc: ClientCutText length={length}");
+                debug!("vnc: client sent SetPixelFormat");
+            }
+            1 => {
+                let mut header = [0u8; 6];
+                if reader.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let n_entries = u16::from_be_bytes([header[4], header[5]]) as usize;
+                let entry_size = 6 * n_entries;
+                let mut entries = vec![0u8; entry_size];
+                if reader.read_exact(&mut entries).is_err() {
+                    break;
+                }
+                let first_idx = u16::from_be_bytes([header[2], header[3]]);
+                debug!("vnc: SetColorMapEntries first={first_idx} n={n_entries}");
+            }
+            2 => {
+                let mut header = [0u8; 4];
+                if reader.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let count = u16::from_be_bytes([header[2], header[3]]) as usize;
+                let mut encodings = vec![0u8; 4 * count];
+                if reader.read_exact(&mut encodings).is_err() {
+                    break;
+                }
+                debug!("vnc: SetEncodings count={count}");
+            }
+            3 => {
+                let mut header = [0u8; 4];
+                if reader.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let inc = header[1] != 0;
+                let num_rects = u16::from_be_bytes([header[2], header[3]]) as usize;
+                debug!("vnc: FramebufferUpdateRequest incremental={inc} num_rects={num_rects}");
+                if num_rects > 0 {
+                    let mut rect_data = vec![0u8; num_rects * 12];
+                    let _ = reader.read_exact(&mut rect_data);
+                }
+            }
+            4 => {
+                let mut padding = [0u8; 3];
+                let mut key_data = [0u8; 4];
+                if reader.read_exact(&mut padding).is_err()
+                    || reader.read_exact(&mut key_data).is_err()
+                {
+                    break;
+                }
+                let down = padding[0] != 0;
+                let key = u32::from_be_bytes(key_data);
+
+                let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
+                info!("vnc: key event keysym=0x{key:x} down={down}");
+            }
+            5 => {
+                let mut pointer_data = [0u8; 4];
+                if reader.read_exact(&mut pointer_data).is_err() {
+                    break;
+                }
+                let mask = pointer_data[0];
+                let mut pos = [0u8; 4];
+                if reader.read_exact(&mut pos).is_err() {
+                    break;
+                }
+                let x = u16::from_be_bytes([pos[0], pos[1]]) as u32;
+                let y = u16::from_be_bytes([pos[2], pos[3]]) as u32;
+
+                let left_down = (mask & 1) != 0;
+                let middle_down = (mask & 2) != 0;
+                let right_down = (mask & 4) != 0;
+
+                let _ = input_sender.send(VncInputEvent::MouseButton {
+                    button: 0,
+                    down: left_down,
+                });
+                let _ = input_sender.send(VncInputEvent::MouseButton {
+                    button: 1,
+                    down: middle_down,
+                });
+                let _ = input_sender.send(VncInputEvent::MouseButton {
+                    button: 2,
+                    down: right_down,
+                });
+                let _ = input_sender.send(VncInputEvent::PointerPosition { x, y });
+
+                debug!("vnc: pointer event mask={mask} x={x} y={y}");
+            }
+            6 => {
+                let mut header = [0u8; 4];
+                if reader.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let length = u32::from_be_bytes(header) as usize;
+                if length > 0 {
+                    let mut text = vec![0u8; length];
+                    if reader.read_exact(&mut text).is_err() {
+                        break;
+                    }
+                    debug!("vnc: ClientCutText length={length}");
+                }
+            }
+            9 => {
+                let mut header = [0u8; 4];
+                if reader.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let first_color = u16::from_be_bytes([header[0], header[1]]);
+                let num_colors = u16::from_be_bytes([header[2], header[3]]) as usize;
+                let mut entries = vec![0u8; 6 * num_colors];
+                if reader.read_exact(&mut entries).is_err() {
+                    break;
+                }
+                debug!("vnc: SetColourValues first={first_color} num={num_colors}");
+            }
+            // QEMU Extended Client Message (TigerVNC preferred format)
+            0xFF => {
+                let mut data = [0u8; 12];
+                if reader.read_exact(&mut data).is_err() {
+                    break;
+                }
+                let sub_type = data[0];
+                if sub_type == 0 {
+                    // QEMU Extended KeyEvent:
+                    // sub-type(1) + down-flag(U16) + keysym(U32) + keycode(U32) = 12 bytes
+                    let down = u16::from_be_bytes([data[1], data[2]]) != 0;
+                    let key = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
+                    let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
+                    info!("vnc: qemu key event keysym=0x{key:x} down={down}");
+                } else {
+                    info!("vnc: qemu extended msg sub-type={sub_type}");
+                }
+            }
+            _ => {
+                info!("vnc: unknown message type 0x{:02x}", msg_type[0]);
             }
         }
-        _ => {
-            debug!("vnc: unknown message type {}", msg_type[0]);
-        }
-    }
     }
 
     Ok(())
