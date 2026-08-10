@@ -11,6 +11,8 @@ use log::{debug, error, info, warn};
 
 use crate::framebuffer::FramebufferSurface;
 
+const MAX_CLIENT_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
 /// VNC input event types
 #[derive(Debug, Clone)]
 pub enum VncInputEvent {
@@ -309,6 +311,7 @@ fn handle_client(
 
     let fb_interval = Duration::from_millis(40); // 25 FPS for framebuffer updates
     let input_interval = Duration::from_millis(100); // 10 Hz for input polling
+    let mut input_buffer = Vec::new();
 
     while running.load(Ordering::SeqCst) {
         let sleep_duration = {
@@ -336,9 +339,10 @@ fn handle_client(
             let readable = polled && (poll_fd.revents & libc::POLLIN) != 0;
 
             if readable {
-                // Keep non-blocking — check_client_input stops on WouldBlock/EAGAIN.
+                // Keep non-blocking. Incomplete RFB messages remain buffered until
+                // the rest of the message arrives.
                 info!("vnc: socket readable, draining input");
-                if let Err(e) = check_client_input(&mut *s, input_sender) {
+                if let Err(e) = check_client_input(&mut *s, input_sender, &mut input_buffer) {
                     warn!("vnc: input read error: {}", e);
                 }
             }
@@ -582,164 +586,225 @@ fn send_framebuffer_update<W: Write>(
 fn check_client_input<R: Read>(
     reader: &mut R,
     input_sender: &mpsc::Sender<VncInputEvent>,
+    input_buffer: &mut Vec<u8>,
 ) -> Result<()> {
+    let mut read_buffer = [0u8; 4096];
+
     loop {
-        let mut msg_type = [0u8; 1];
-        if reader.read_exact(&mut msg_type).is_err() {
-            break;
-        }
-
-        match msg_type[0] {
-            0 => {
-                let mut rest = [0u8; 23];
-                if reader.read_exact(&mut rest).is_err() {
-                    break;
-                }
-                debug!("vnc: client sent SetPixelFormat");
+        match reader.read(&mut read_buffer) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "client disconnected",
+                ));
             }
-            1 => {
-                let mut header = [0u8; 6];
-                if reader.read_exact(&mut header).is_err() {
-                    break;
-                }
-                let n_entries = u16::from_be_bytes([header[4], header[5]]) as usize;
-                let entry_size = 6 * n_entries;
-                let mut entries = vec![0u8; entry_size];
-                if reader.read_exact(&mut entries).is_err() {
-                    break;
-                }
-                let first_idx = u16::from_be_bytes([header[2], header[3]]);
-                debug!("vnc: SetColorMapEntries first={first_idx} n={n_entries}");
-            }
-            2 => {
-                let mut header = [0u8; 4];
-                if reader.read_exact(&mut header).is_err() {
-                    break;
-                }
-                let count = u16::from_be_bytes([header[2], header[3]]) as usize;
-                let mut encodings = vec![0u8; 4 * count];
-                if reader.read_exact(&mut encodings).is_err() {
-                    break;
-                }
-                debug!("vnc: SetEncodings count={count}");
-            }
-            3 => {
-                let mut header = [0u8; 4];
-                if reader.read_exact(&mut header).is_err() {
-                    break;
-                }
-                let inc = header[1] != 0;
-                let num_rects = u16::from_be_bytes([header[2], header[3]]) as usize;
-                debug!("vnc: FramebufferUpdateRequest incremental={inc} num_rects={num_rects}");
-                if num_rects > 0 {
-                    let mut rect_data = vec![0u8; num_rects * 12];
-                    let _ = reader.read_exact(&mut rect_data);
+            Ok(size) => {
+                input_buffer.extend_from_slice(&read_buffer[..size]);
+                if input_buffer.len() > MAX_CLIENT_MESSAGE_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "client input buffer exceeds the maximum message size",
+                    ));
                 }
             }
-            4 => {
-                let mut padding = [0u8; 3];
-                let mut key_data = [0u8; 4];
-                if reader.read_exact(&mut padding).is_err()
-                    || reader.read_exact(&mut key_data).is_err()
-                {
-                    break;
-                }
-                let down = padding[0] != 0;
-                let key = u32::from_be_bytes(key_data);
-
-                let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
-                info!("vnc: key event keysym=0x{key:x} down={down}");
-            }
-            5 => {
-                let mut pointer_data = [0u8; 4];
-                if reader.read_exact(&mut pointer_data).is_err() {
-                    break;
-                }
-                let mask = pointer_data[0];
-                let mut pos = [0u8; 4];
-                if reader.read_exact(&mut pos).is_err() {
-                    break;
-                }
-                let x = u16::from_be_bytes([pos[0], pos[1]]) as u32;
-                let y = u16::from_be_bytes([pos[2], pos[3]]) as u32;
-
-                let left_down = (mask & 1) != 0;
-                let middle_down = (mask & 2) != 0;
-                let right_down = (mask & 4) != 0;
-
-                let _ = input_sender.send(VncInputEvent::MouseButton {
-                    button: 0,
-                    down: left_down,
-                });
-                let _ = input_sender.send(VncInputEvent::MouseButton {
-                    button: 1,
-                    down: middle_down,
-                });
-                let _ = input_sender.send(VncInputEvent::MouseButton {
-                    button: 2,
-                    down: right_down,
-                });
-                let _ = input_sender.send(VncInputEvent::PointerPosition { x, y });
-
-                debug!("vnc: pointer event mask={mask} x={x} y={y}");
-            }
-            6 => {
-                let mut header = [0u8; 4];
-                if reader.read_exact(&mut header).is_err() {
-                    break;
-                }
-                let length = u32::from_be_bytes(header) as usize;
-                if length > 0 {
-                    let mut text = vec![0u8; length];
-                    if reader.read_exact(&mut text).is_err() {
-                        break;
-                    }
-                    debug!("vnc: ClientCutText length={length}");
-                }
-            }
-            9 => {
-                let mut header = [0u8; 4];
-                if reader.read_exact(&mut header).is_err() {
-                    break;
-                }
-                let first_color = u16::from_be_bytes([header[0], header[1]]);
-                let num_colors = u16::from_be_bytes([header[2], header[3]]) as usize;
-                let mut entries = vec![0u8; 6 * num_colors];
-                if reader.read_exact(&mut entries).is_err() {
-                    break;
-                }
-                debug!("vnc: SetColourValues first={first_color} num={num_colors}");
-            }
-            // QEMU Extended Client Message (TigerVNC preferred format)
-            0xFF => {
-                let mut data = [0u8; 12];
-                if reader.read_exact(&mut data).is_err() {
-                    break;
-                }
-                let sub_type = data[0];
-                if sub_type == 0 {
-                    // QEMU Extended KeyEvent:
-                    // sub-type(1) + down-flag(U16) + keysym(U32) + keycode(U32) = 12 bytes
-                    let down = u16::from_be_bytes([data[1], data[2]]) != 0;
-                    let key = u32::from_be_bytes([data[3], data[4], data[5], data[6]]);
-                    let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
-                    info!("vnc: qemu key event keysym=0x{key:x} down={down}");
-                } else {
-                    info!("vnc: qemu extended msg sub-type={sub_type}");
-                }
-            }
-            _ => {
-                info!("vnc: unknown message type 0x{:02x}", msg_type[0]);
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
     }
 
-    Ok(())
+    drain_client_input(input_buffer, input_sender)
+}
+
+fn drain_client_input(
+    input_buffer: &mut Vec<u8>,
+    input_sender: &mpsc::Sender<VncInputEvent>,
+) -> Result<()> {
+    loop {
+        let Some(message_size) = client_message_size(input_buffer)? else {
+            return Ok(());
+        };
+        if input_buffer.len() < message_size {
+            return Ok(());
+        }
+
+        handle_client_message(&input_buffer[..message_size], input_sender);
+        input_buffer.drain(..message_size);
+    }
+}
+
+fn client_message_size(input_buffer: &[u8]) -> Result<Option<usize>> {
+    if input_buffer.is_empty() {
+        return Ok(None);
+    }
+
+    let message_size = match input_buffer[0] {
+        // SetPixelFormat: type + padding + pixel format.
+        0 => 24,
+        // SetColorMapEntries: type + padding + first color + count + colors.
+        1 => {
+            if input_buffer.len() < 6 {
+                return Ok(None);
+            }
+            variable_message_size(
+                6,
+                u16::from_be_bytes([input_buffer[4], input_buffer[5]]) as usize,
+                6,
+            )?
+        }
+        // SetEncodings: type + padding + count + encodings.
+        2 => {
+            if input_buffer.len() < 4 {
+                return Ok(None);
+            }
+            variable_message_size(
+                4,
+                u16::from_be_bytes([input_buffer[2], input_buffer[3]]) as usize,
+                4,
+            )?
+        }
+        // FramebufferUpdateRequest: type + incremental + x/y/width/height.
+        3 => 10,
+        // KeyEvent: type + down flag + padding + keysym.
+        4 => 8,
+        // PointerEvent: type + button mask + x/y.
+        5 => 6,
+        // ClientCutText: type + padding + text length + text.
+        6 => {
+            if input_buffer.len() < 8 {
+                return Ok(None);
+            }
+            variable_message_size(
+                8,
+                u32::from_be_bytes([
+                    input_buffer[4],
+                    input_buffer[5],
+                    input_buffer[6],
+                    input_buffer[7],
+                ]) as usize,
+                1,
+            )?
+        }
+        // SetColourValues: type + first color + count + color values.
+        9 => {
+            if input_buffer.len() < 5 {
+                return Ok(None);
+            }
+            variable_message_size(
+                5,
+                u16::from_be_bytes([input_buffer[3], input_buffer[4]]) as usize,
+                6,
+            )?
+        }
+        // QEMU extended client message: type + 12-byte payload.
+        0xFF => 13,
+        message_type => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unsupported client message type 0x{message_type:02x}"),
+            ));
+        }
+    };
+
+    Ok(Some(message_size))
+}
+
+fn variable_message_size(header_size: usize, count: usize, item_size: usize) -> Result<usize> {
+    let message_size = count
+        .checked_mul(item_size)
+        .and_then(|items_size| header_size.checked_add(items_size))
+        .filter(|&size| size <= MAX_CLIENT_MESSAGE_SIZE)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "client message exceeds the maximum supported size",
+            )
+        })?;
+
+    Ok(message_size)
+}
+
+fn handle_client_message(message: &[u8], input_sender: &mpsc::Sender<VncInputEvent>) {
+    match message[0] {
+        0 => {
+            debug!("vnc: client sent SetPixelFormat");
+        }
+        1 => {
+            let first_idx = u16::from_be_bytes([message[2], message[3]]);
+            let n_entries = u16::from_be_bytes([message[4], message[5]]);
+            debug!("vnc: SetColorMapEntries first={first_idx} n={n_entries}");
+        }
+        2 => {
+            let count = u16::from_be_bytes([message[2], message[3]]);
+            debug!("vnc: SetEncodings count={count}");
+        }
+        3 => {
+            let incremental = message[1] != 0;
+            let x = u16::from_be_bytes([message[2], message[3]]);
+            let y = u16::from_be_bytes([message[4], message[5]]);
+            let width = u16::from_be_bytes([message[6], message[7]]);
+            let height = u16::from_be_bytes([message[8], message[9]]);
+            debug!(
+                "vnc: FramebufferUpdateRequest incremental={incremental} x={x} y={y} width={width} height={height}"
+            );
+        }
+        4 => {
+            let down = message[1] != 0;
+            let key = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
+
+            let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
+            info!("vnc: key event keysym=0x{key:x} down={down}");
+        }
+        5 => {
+            let mask = message[1];
+            let x = u16::from_be_bytes([message[2], message[3]]) as u32;
+            let y = u16::from_be_bytes([message[4], message[5]]) as u32;
+
+            let _ = input_sender.send(VncInputEvent::MouseButton {
+                button: 0,
+                down: (mask & 1) != 0,
+            });
+            let _ = input_sender.send(VncInputEvent::MouseButton {
+                button: 1,
+                down: (mask & 2) != 0,
+            });
+            let _ = input_sender.send(VncInputEvent::MouseButton {
+                button: 2,
+                down: (mask & 4) != 0,
+            });
+            let _ = input_sender.send(VncInputEvent::PointerPosition { x, y });
+
+            debug!("vnc: pointer event mask={mask} x={x} y={y}");
+        }
+        6 => {
+            let length = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
+            debug!("vnc: ClientCutText length={length}");
+        }
+        9 => {
+            let first_color = u16::from_be_bytes([message[1], message[2]]);
+            let num_colors = u16::from_be_bytes([message[3], message[4]]);
+            debug!("vnc: SetColourValues first={first_color} num={num_colors}");
+        }
+        0xFF => {
+            let sub_type = message[1];
+            if sub_type == 0 {
+                // QEMU Extended KeyEvent: sub-type + down-flag(U16) + keysym(U32) + keycode(U32).
+                let down = u16::from_be_bytes([message[2], message[3]]) != 0;
+                let key = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
+                let _ = input_sender.send(VncInputEvent::Keyboard { key, down });
+                info!("vnc: qemu key event keysym=0x{key:x} down={down}");
+            } else {
+                info!("vnc: qemu extended msg sub-type={sub_type}");
+            }
+        }
+        _ => unreachable!("client_message_size validates message types"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::Cursor;
 
     struct MockSocket {
@@ -778,6 +843,33 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    struct NonBlockingReader {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    impl NonBlockingReader {
+        fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into_iter().collect(),
+            }
+        }
+
+        fn queue_read_data(&mut self, data: Vec<u8>) {
+            self.chunks.push_back(data);
+        }
+    }
+
+    impl Read for NonBlockingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let Some(chunk) = self.chunks.pop_front() else {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            };
+            assert!(chunk.len() <= buffer.len());
+            buffer[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
         }
     }
 
@@ -837,5 +929,48 @@ mod tests {
         // Server init starts at offset 18
         assert_eq!(&w[18..20], &(800u16).to_be_bytes());
         assert_eq!(&w[20..22], &(600u16).to_be_bytes());
+    }
+
+    #[test]
+    fn test_fragmented_key_event_is_retained() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let mut reader = NonBlockingReader::new([vec![4, 1, 0, 0, 0, 0]]);
+        let mut input_buffer = Vec::new();
+
+        check_client_input(&mut reader, &input_sender, &mut input_buffer).unwrap();
+        assert!(input_receiver.try_recv().is_err());
+        assert_eq!(input_buffer, vec![4, 1, 0, 0, 0, 0]);
+
+        reader.queue_read_data(vec![0, 0x66]); // X11 keysym 'f'
+        check_client_input(&mut reader, &input_sender, &mut input_buffer).unwrap();
+
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::Keyboard {
+                key: 0x66,
+                down: true,
+            }
+        ));
+        assert!(input_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_set_encodings_does_not_consume_following_key_event() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let mut input_buffer = vec![
+            2, 0, 0, 1, 0, 0, 0, 0, // SetEncodings with one Raw encoding.
+            4, 1, 0, 0, 0, 0, 0, 0x66, // KeyEvent for 'f'.
+        ];
+
+        drain_client_input(&mut input_buffer, &input_sender).unwrap();
+
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::Keyboard {
+                key: 0x66,
+                down: true,
+            }
+        ));
+        assert!(input_buffer.is_empty());
     }
 }
