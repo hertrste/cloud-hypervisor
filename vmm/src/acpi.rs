@@ -276,6 +276,15 @@ pub fn create_dsdt_table(
 }
 
 const FACP_DSDT_OFFSET: usize = 140;
+#[cfg(target_arch = "x86_64")]
+const FACP_IAPC_BOOT_ARCH_OFFSET: usize = 109;
+
+#[cfg(target_arch = "x86_64")]
+fn set_iapc_boot_arch(facp: &mut Sdt) {
+    // LEGACY_DEVICES + 8042. The latter tells Windows that the legacy
+    // keyboard controller is present and that i8042prt should be loaded.
+    facp.write(FACP_IAPC_BOOT_ARCH_OFFSET, 0x0003u16);
+}
 
 fn create_facp_table(dsdt_offset: GuestAddress, device_manager: &DeviceManager) -> Sdt {
     trace_scoped!("create_facp_table");
@@ -320,8 +329,7 @@ fn create_facp_table(dsdt_offset: GuestAddress, device_manager: &DeviceManager) 
 
     // x86_64 specific fields
     #[cfg(target_arch = "x86_64")]
-    // IAPC_BOOT_ARCH: Legacy 8042 port present + keyboard controller present
-    facp.write(130, 0x0003u16);
+    set_iapc_boot_arch(&mut facp);
 
     // Architecture common fields
     // HW_REDUCED_ACPI, RESET_REG_SUP, TMR_VAL_EXT
@@ -1182,6 +1190,21 @@ pub fn create_acpi_tables_tdx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_iapc_boot_arch_offset() {
+        let mut facp = Sdt::new(*b"FACP", 276, 6, *b"CLOUDH", *b"CHFACP  ", 1);
+        facp.write(131, 3u8);
+
+        set_iapc_boot_arch(&mut facp);
+
+        assert_eq!(
+            &facp.as_slice()[FACP_IAPC_BOOT_ARCH_OFFSET..FACP_IAPC_BOOT_ARCH_OFFSET + 2],
+            &[0x03, 0x00]
+        );
+        assert_eq!(facp.as_slice()[131], 3);
+    }
 
     #[test]
     fn test_generic_initiator_affinity_size() {

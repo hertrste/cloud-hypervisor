@@ -5020,6 +5020,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             pmem: None,
             serial: SerialConfig::default(),
             console: ConsoleConfig::default(),
+            display: DisplayConfig::default(),
             #[cfg(target_arch = "x86_64")]
             debug_console: DebugConsoleConfig::default(),
             devices: None,
@@ -5275,6 +5276,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 },
                 pci_common: PciDeviceCommonConfig::default(),
             },
+            display: DisplayConfig::default(),
             #[cfg(target_arch = "x86_64")]
             debug_console: DebugConsoleConfig::default(),
             devices: None,

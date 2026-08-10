@@ -148,6 +148,73 @@ const DEBUGCON_DEVICE_NAME: &str = "__debug_console";
 const GPIO_DEVICE_NAME: &str = "__gpio";
 const RNG_DEVICE_NAME: &str = "__rng";
 const IOMMU_DEVICE_NAME: &str = "__iommu";
+
+/// ACPI small IRQ descriptor used by legacy ISA Plug and Play devices.
+///
+/// Windows' i8042 driver expects the PS/2 IRQ resources in this legacy form,
+/// matching conventional PC firmware, rather than as extended interrupts.
+#[cfg(target_arch = "x86_64")]
+struct LegacyIrq(u8);
+
+#[cfg(target_arch = "x86_64")]
+impl LegacyIrq {
+    fn new(irq: u8) -> Self {
+        assert!(irq < 16);
+        Self(irq)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Aml for LegacyIrq {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
+        // Small resource descriptor: IRQ format, two-byte IRQ mask, no flags.
+        sink.byte(0x22);
+        sink.word(1u16 << self.0);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn write_ps2_aml(sink: &mut dyn acpi_tables::AmlSink) {
+    let keyboard_data_port = aml::IO::new(0x0060, 0x0060, 0x01, 0x01);
+    let keyboard_command_port = aml::IO::new(0x0064, 0x0064, 0x01, 0x01);
+    let keyboard_irq = LegacyIrq::new(1);
+    let keyboard_resources = aml::ResourceTemplate::new(vec![
+        &keyboard_data_port,
+        &keyboard_command_port,
+        &keyboard_irq,
+    ]);
+    let keyboard_hid = aml::EISAName::new("PNP0303");
+    let keyboard_hid_name = aml::Name::new("_HID".into(), &keyboard_hid);
+    let keyboard_status = aml::Name::new("_STA".into(), &0x0fu8);
+    let keyboard_crs = aml::Name::new("_CRS".into(), &keyboard_resources);
+    let keyboard = aml::Device::new(
+        "KBD_".into(),
+        vec![&keyboard_hid_name, &keyboard_status, &keyboard_crs],
+    );
+
+    let mouse_irq = LegacyIrq::new(12);
+    let mouse_resources = aml::ResourceTemplate::new(vec![&mouse_irq]);
+    let mouse_hid = aml::EISAName::new("PNP0F13");
+    let mouse_hid_name = aml::Name::new("_HID".into(), &mouse_hid);
+    let mouse_status = aml::Name::new("_STA".into(), &0x0fu8);
+    let mouse_crs = aml::Name::new("_CRS".into(), &mouse_resources);
+    let mouse = aml::Device::new(
+        "MOU_".into(),
+        vec![&mouse_hid_name, &mouse_status, &mouse_crs],
+    );
+
+    // Windows expects legacy devices to be children of an ISA/LPC bus, as
+    // they are on physical PCs and QEMU. PNP0A05 is the ACPI generic bus
+    // container for devices enumerated entirely from the namespace.
+    let isa_hid = aml::EISAName::new("PNP0A05");
+    let isa_hid_name = aml::Name::new("_HID".into(), &isa_hid);
+    let isa_status = aml::Name::new("_STA".into(), &0x0fu8);
+    aml::Device::new(
+        "_SB_.PC00.ISA_".into(),
+        vec![&isa_hid_name, &isa_status, &keyboard, &mouse],
+    )
+    .to_aml_bytes(sink);
+}
 #[cfg(feature = "pvmemcontrol")]
 const PVMEMCONTROL_DEVICE_NAME: &str = "__pvmemcontrol";
 const BALLOON_DEVICE_NAME: &str = "__balloon";
@@ -5978,47 +6045,9 @@ impl Aml for DeviceManager {
             .to_aml_bytes(sink);
         }
 
-        // PS/2 keyboard device
+        // PS/2 controller devices
         #[cfg(target_arch = "x86_64")]
-        aml::Device::new(
-            "_SB_.KBD ".into(),
-            vec![
-                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0303")),
-                &aml::Name::new("_CID".into(), &aml::EISAName::new("PNP030B")),
-                &aml::Name::new("_UID".into(), &aml::ZERO),
-                &aml::Name::new(
-                    "_CRS".into(),
-                    &aml::ResourceTemplate::new(vec![
-                        &aml::IO::new(0x0060, 0x0060, 0x00, 0x01),
-                        &aml::IO::new(0x0064, 0x0064, 0x00, 0x01),
-                        &aml::Interrupt::new(true, true, false, false, 1),
-                    ]),
-                ),
-            ],
-        )
-        .to_aml_bytes(sink);
-
-        // PS/2 mouse device
-        #[cfg(target_arch = "x86_64")]
-        aml::Device::new(
-            "_SB_.MOU ".into(),
-            vec![
-                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0F03")),
-                &aml::Name::new("_CID".into(), &aml::EISAName::new("PNP0F13")),
-                &aml::Name::new("_UID".into(), &aml::ZERO),
-                &aml::Name::new(
-                    "_CRS".into(),
-                    &aml::ResourceTemplate::new(vec![&aml::Interrupt::new(
-                        true,
-                        true,
-                        false,
-                        false,
-                        12,
-                    )]),
-                ),
-            ],
-        )
-        .to_aml_bytes(sink);
+        write_ps2_aml(sink);
 
         create_s5_sleep_state(sink);
 
@@ -6312,6 +6341,31 @@ mod unit_tests {
                 0x08, b'_', b'S', b'5', b'_', 0x12, 0x08, 0x04, 0x0a, 0x05, 0x0a, 0x05, 0x00, 0x00,
             ]
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_legacy_irq_descriptor() {
+        let mut bytes = Vec::new();
+
+        LegacyIrq::new(1).to_aml_bytes(&mut bytes);
+        assert_eq!(bytes, vec![0x22, 0x02, 0x00]);
+
+        bytes.clear();
+        LegacyIrq::new(12).to_aml_bytes(&mut bytes);
+        assert_eq!(bytes, vec![0x22, 0x00, 0x10]);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_ps2_device_names_are_valid_name_segs() {
+        let mut bytes = Vec::new();
+
+        write_ps2_aml(&mut bytes);
+
+        assert!(bytes.windows(4).any(|name| name == b"ISA_"));
+        assert!(bytes.windows(4).any(|name| name == b"KBD_"));
+        assert!(bytes.windows(4).any(|name| name == b"MOU_"));
     }
 
     #[test]

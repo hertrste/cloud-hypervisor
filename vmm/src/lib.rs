@@ -3595,6 +3595,7 @@ mod unit_tests {
                 },
                 pci_common: PciDeviceCommonConfig::default(),
             },
+            display: crate::vm_config::DisplayConfig::default(),
             #[cfg(target_arch = "x86_64")]
             debug_console: DebugConsoleConfig::default(),
             devices: None,
