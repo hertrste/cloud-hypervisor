@@ -466,16 +466,25 @@ fn handle_client(
 
                         if writable {
                             let config = surface.config();
-                            if send_framebuffer_update(
+                            // Framebuffer updates can be much larger than the socket send
+                            // buffer, especially when sent through nova-novncproxy. The
+                            // stream is normally non-blocking, so write_all() can otherwise
+                            // return WouldBlock after sending only part of an RFB message.
+                            // Send a complete update synchronously for now; a future
+                            // non-blocking implementation should retain and drain partial
+                            // framebuffer updates on POLLOUT.
+                            s.set_nonblocking(false)?;
+                            let send_result = send_framebuffer_update(
                                 &mut *s,
                                 &current_data,
                                 config.width,
                                 config.height,
                                 config.stride,
                                 client_state.pixel_format,
-                            )
-                            .is_err()
-                            {
+                            );
+                            s.set_nonblocking(true)?;
+
+                            if send_result.is_err() {
                                 warn!(
                                     "vnc: failed to send framebuffer update, client disconnected"
                                 );
