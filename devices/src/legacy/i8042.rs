@@ -27,6 +27,11 @@ const CMD_READ_PORT_A: u8 = 0x20;
 const CMD_READ_PORT_B: u8 = 0x21;
 
 // CTR (Controller Configuration Register) bits
+const CTR_KBD_INT: u8 = 1 << 0;
+const CTR_AUX_INT: u8 = 1 << 1;
+const CTR_SYSTEM_FLAG: u8 = 1 << 2;
+const CTR_KBD_DISABLE: u8 = 1 << 4;
+const CTR_AUX_DISABLE: u8 = 1 << 5;
 const CTR_XLATE: u8 = 1 << 6; // Scancode translation enable (Set 2 → Set 1)
 const CMD_WRITE_PORT_A: u8 = 0x60;
 const CMD_TEST_CONTROLLER: u8 = 0xAA;
@@ -34,15 +39,15 @@ const CMD_DISABLE_SECONDARY: u8 = 0xA7;
 const CMD_DISABLE_KEYBOARD: u8 = 0xAD;
 const CMD_ENABLE_KEYBOARD: u8 = 0xAE;
 const CMD_ENABLE_SECONDARY: u8 = 0xA8;
+const CMD_TEST_SECONDARY: u8 = 0xA9;
 const CMD_READ_KBD_INPUT: u8 = 0xD0;
-const CMD_TEST_KEYBOARD: u8 = 0xD1;
+const CMD_WRITE_KBD_CTRL: u8 = 0xD1;
 const CMD_WRITE_KBD_OUTPUT: u8 = 0xD2;
 const CMD_WRITE_SECONDARY_OUTPUT: u8 = 0xD3;
+const CMD_WRITE_TO_AUX: u8 = 0xD4;
 const CMD_SELF_TEST: u8 = 0xF0;
 const CMD_RESET_CONTROLLER: u8 = 0xFE;
-const CMD_PULSE_INTERRUPT: u8 = 0xA9;
-const CMD_READ_KBD_CTRL: u8 = 0xAB;
-const CMD_WRITE_KBD_CTRL: u8 = 0xB0;
+const CMD_TEST_KEYBOARD: u8 = 0xAB;
 
 // PS/2 status register bits
 const STATUS_OUTPUT_BUFFER_FULL: u8 = 1 << 0;
@@ -52,8 +57,7 @@ const STATUS_SYSTEM_FLAG: u8 = 1 << 2;
 #[allow(dead_code)]
 const STATUS_COMMAND_DATA: u8 = 1 << 3;
 const STATUS_KEYLOCK: u8 = 1 << 4;
-#[allow(dead_code)]
-const STATUS_TIMEOUT: u8 = 1 << 5;
+const STATUS_AUX_OUTPUT_BUFFER_FULL: u8 = 1 << 5;
 #[allow(dead_code)]
 const STATUS_PARITY_ERROR: u8 = 1 << 6;
 #[allow(dead_code)]
@@ -78,17 +82,16 @@ pub enum InputEvent {
     Mouse { buttons: u8, dx: i16, dy: i16 },
 }
 
-/// PS/2 keyboard scan code set 1 (IBM PC/AT compatible).
-/// Maps virtual key codes to make/break scan codes.
+/// Maps X11 keysyms to PS/2 keyboard scan codes.
 struct KeyboardMap;
 
 impl KeyboardMap {
-    /// Generate PS/2 Set 1 scan codes from an X11 keysym (US keyboard layout).
+    /// Generate scan codes from an X11 keysym (US keyboard layout).
     /// Returns a Vec of bytes to send to the PS/2 data port.
     ///
     /// Returns (make_code, needs_e0_prefix). Keys in the dedicated arrow/navigation
     /// cluster and KP_Enter/KP_Divide require the 0xE0 extension prefix.
-    fn scan_codes(key: u32, pressed: bool) -> Vec<u8> {
+    fn scan_codes(key: u32, pressed: bool, send_set1: bool) -> Vec<u8> {
         let (make_code, e0) = match key {
             // Letters (lowercase X11 keysyms) -> PS/2 Set 1
             0x61 => (0x1E, false), // a
@@ -179,9 +182,9 @@ impl KeyboardMap {
             0xFFE1 => (0x2A, false), // Shift_L
             0xFFE2 => (0x36, false), // Shift_R
             0xFFE3 => (0x1D, false), // Control_L
-            0xFFE4 => (0x1D, false), // Control_R
+            0xFFE4 => (0x1D, true),  // Control_R
             0xFFE9 => (0x38, false), // Alt_L
-            0xFFEA => (0xB8, false), // Alt_R (AltGr)
+            0xFFEA => (0x38, true),  // Alt_R (AltGr)
             0xFFE5 => (0x3A, false), // Caps_Lock
             0xFF08 => (0x0E, false), // BackSpace
 
@@ -224,11 +227,11 @@ impl KeyboardMap {
             0xFF98 => (0x48, false), // KP_8
             0xFF99 => (0x49, false), // KP_9
             0xFFAE => (0x53, false), // KP_Decimal
-            0xFF8D => (0x1C, true), // KP_Enter (E0-prefixed)
+            0xFF8D => (0x1C, true),  // KP_Enter (E0-prefixed)
             0xFF6B => (0x4E, false), // KP_Add
             0xFF6D => (0x4A, false), // KP_Subtract
             0xFF6A => (0x37, false), // KP_Multiply
-            0xFF6F => (0x35, true), // KP_Divide (E0-prefixed)
+            0xFF6F => (0x35, true),  // KP_Divide (E0-prefixed)
             _ => (0x00, false),      // Unknown key
         };
 
@@ -236,23 +239,149 @@ impl KeyboardMap {
             return Vec::new();
         }
 
-        if pressed {
-            if e0 {
-                vec![0xE0, make_code]
+        if send_set1 {
+            if pressed {
+                if e0 {
+                    vec![0xE0, make_code]
+                } else {
+                    vec![make_code]
+                }
             } else {
-                vec![make_code]
+                let break_code = make_code | 0x80;
+                if e0 {
+                    vec![0xE0, break_code]
+                } else {
+                    vec![break_code]
+                }
             }
         } else {
-            // The controller advertises translated scan code set 1. Set 1 break
-            // codes have bit 7 set; 0xF0 is the set 2 break prefix and would make
-            // the guest interpret the following make code as another key press.
-            let break_code = make_code | 0x80;
-            if e0 {
-                vec![0xE0, break_code]
-            } else {
-                vec![break_code]
+            let Some(make_code) = Self::set2_make_code(make_code, e0) else {
+                return Vec::new();
+            };
+
+            match (pressed, e0) {
+                (true, true) => vec![0xE0, make_code],
+                (true, false) => vec![make_code],
+                (false, true) => vec![0xE0, 0xF0, make_code],
+                (false, false) => vec![0xF0, make_code],
             }
         }
+    }
+
+    /// Translate the set-1 make codes above to their set-2 equivalent.
+    ///
+    /// Input normally passes through the i8042 translation engine.  Firmware
+    /// can disable that engine, however, in which case the keyboard has to
+    /// provide raw set-2 bytes instead.
+    fn set2_make_code(set1: u8, e0: bool) -> Option<u8> {
+        let set2 = if e0 {
+            match set1 {
+                0x1C => 0x5A,
+                0x1D => 0x14,
+                0x35 => 0x4A,
+                0x38 => 0x11,
+                0x47 => 0x6C,
+                0x48 => 0x75,
+                0x49 => 0x7D,
+                0x4B => 0x6B,
+                0x4D => 0x74,
+                0x4F => 0x69,
+                0x50 => 0x72,
+                0x51 => 0x7A,
+                0x52 => 0x70,
+                0x53 => 0x71,
+                _ => return None,
+            }
+        } else {
+            match set1 {
+                0x01 => 0x76,
+                0x02 => 0x16,
+                0x03 => 0x1E,
+                0x04 => 0x26,
+                0x05 => 0x25,
+                0x06 => 0x2E,
+                0x07 => 0x36,
+                0x08 => 0x3D,
+                0x09 => 0x3E,
+                0x0A => 0x46,
+                0x0B => 0x45,
+                0x0C => 0x4E,
+                0x0D => 0x55,
+                0x0E => 0x66,
+                0x0F => 0x0D,
+                0x10 => 0x15,
+                0x11 => 0x1D,
+                0x12 => 0x24,
+                0x13 => 0x2D,
+                0x14 => 0x2C,
+                0x15 => 0x35,
+                0x16 => 0x3C,
+                0x17 => 0x43,
+                0x18 => 0x44,
+                0x19 => 0x4D,
+                0x1A => 0x54,
+                0x1B => 0x5B,
+                0x1C => 0x5A,
+                0x1D => 0x14,
+                0x1E => 0x1C,
+                0x1F => 0x1B,
+                0x20 => 0x23,
+                0x21 => 0x2B,
+                0x22 => 0x34,
+                0x23 => 0x33,
+                0x24 => 0x3B,
+                0x25 => 0x42,
+                0x26 => 0x4B,
+                0x27 => 0x4C,
+                0x28 => 0x52,
+                0x29 => 0x0E,
+                0x2A => 0x12,
+                0x2B => 0x5D,
+                0x2C => 0x1A,
+                0x2D => 0x22,
+                0x2E => 0x21,
+                0x2F => 0x2A,
+                0x30 => 0x32,
+                0x31 => 0x31,
+                0x32 => 0x3A,
+                0x33 => 0x41,
+                0x34 => 0x49,
+                0x35 => 0x4A,
+                0x36 => 0x59,
+                0x37 => 0x7C,
+                0x38 => 0x11,
+                0x39 => 0x29,
+                0x3A => 0x58,
+                0x3B => 0x05,
+                0x3C => 0x06,
+                0x3D => 0x04,
+                0x3E => 0x0C,
+                0x3F => 0x03,
+                0x40 => 0x0B,
+                0x41 => 0x83,
+                0x42 => 0x0A,
+                0x43 => 0x01,
+                0x44 => 0x09,
+                0x45 => 0x78,
+                0x46 => 0x07,
+                0x47 => 0x6C,
+                0x48 => 0x75,
+                0x49 => 0x7D,
+                0x4A => 0x7B,
+                0x4B => 0x6B,
+                0x4C => 0x73,
+                0x4D => 0x74,
+                0x4E => 0x79,
+                0x4F => 0x69,
+                0x50 => 0x72,
+                0x51 => 0x7A,
+                0x52 => 0x70,
+                0x53 => 0x71,
+                _ => return None,
+            }
+        };
+
+        Some(set2)
     }
 }
 
@@ -271,9 +400,8 @@ pub struct I8042Device {
 
     // Output data buffer (data to send to guest on read of 0x60)
     output_buffer: VecDeque<u8>,
-
-    // Input buffer for command data (written to 0x60 during command sequence)
-    input_buffer: Option<u8>,
+    // Whether each output byte originated from the auxiliary (mouse) port.
+    output_buffer_aux: VecDeque<bool>,
 
     // Port A register (keyboard/mouse presence and status)
     // Bit 0: keyboard output buffer full / keyboard present
@@ -298,19 +426,29 @@ pub struct I8042Device {
 
     // Keyboard state
     keyboard_enabled: bool,
+    keyboard_scancode_set: u8,
     // Tracks currently pressed keys + last event time to filter VNC autorepeat and recover from missed up events
     pressed_keys: HashMap<u32, (bool, Instant)>,
     // Mouse (secondary) state
     mouse_enabled: bool,
+    mouse_reporting_enabled: bool,
+    mouse_resolution: u8,
+    mouse_sample_rate: u8,
+    mouse_scaling_21: bool,
 
     // Pending command that needs data from input buffer
     pending_command: Option<u8>,
+    // Pending mouse command that needs a parameter.
+    pending_mouse_command: Option<u8>,
+    // Pending keyboard command that needs a parameter.
+    pending_keyboard_command: Option<u8>,
 
     // Channel to receive input events from VNC or other sources
     input_channel: Option<Arc<Mutex<VecDeque<InputEvent>>>>,
 
-    // IRQ for keyboard (primary PS/2) interrupt
-    irq: Option<Arc<dyn InterruptSourceGroup>>,
+    // IRQs for the primary keyboard and auxiliary mouse ports.
+    keyboard_irq: Option<Arc<dyn InterruptSourceGroup>>,
+    mouse_irq: Option<Arc<dyn InterruptSourceGroup>>,
 }
 
 impl I8042Device {
@@ -326,7 +464,8 @@ impl I8042Device {
         vcpus_kill_signalled: Arc<AtomicBool>,
         vcpus_pause_signalled: Arc<AtomicBool>,
         input_channel: Option<Arc<Mutex<VecDeque<InputEvent>>>>,
-        irq: Option<Arc<dyn InterruptSourceGroup>>,
+        keyboard_irq: Option<Arc<dyn InterruptSourceGroup>>,
+        mouse_irq: Option<Arc<dyn InterruptSourceGroup>>,
     ) -> I8042Device {
         I8042Device {
             reset_evt,
@@ -334,23 +473,36 @@ impl I8042Device {
             vcpus_pause_signalled,
             status: STATUS_SYSTEM_FLAG | STATUS_KEYLOCK,
             output_buffer: VecDeque::new(),
-            input_buffer: None,
+            output_buffer_aux: VecDeque::new(),
             port_a: 0x00,
             port_b: 0x23,
-            ctr: CTR_XLATE, // Translated mode: i8042 converts Set 2 → Set 1
+            ctr: CTR_KBD_INT | CTR_AUX_INT | CTR_SYSTEM_FLAG | CTR_XLATE,
             control_reg: 0x00,
             keyboard_enabled: true,
+            keyboard_scancode_set: 2,
             pressed_keys: HashMap::new(),
             mouse_enabled: true,
+            mouse_reporting_enabled: false,
+            mouse_resolution: 2,
+            mouse_sample_rate: 100,
+            mouse_scaling_21: false,
             pending_command: None,
+            pending_mouse_command: None,
+            pending_keyboard_command: None,
             input_channel,
-            irq,
+            keyboard_irq,
+            mouse_irq,
         }
     }
 
     /// Get a clone of the IRQ source group, if present.
-    pub fn irq(&self) -> Option<Arc<dyn InterruptSourceGroup>> {
-        self.irq.as_ref().map(Arc::clone)
+    pub fn keyboard_irq(&self) -> Option<Arc<dyn InterruptSourceGroup>> {
+        self.keyboard_irq.as_ref().map(Arc::clone)
+    }
+
+    /// Get a clone of the auxiliary mouse IRQ source group, if present.
+    pub fn mouse_irq(&self) -> Option<Arc<dyn InterruptSourceGroup>> {
+        self.mouse_irq.as_ref().map(Arc::clone)
     }
 
     /// Check whether the output buffer is nearly full.
@@ -360,19 +512,58 @@ impl I8042Device {
         self.output_buffer.len() >= MAX_DATA_BUFFER - 4
     }
 
-    /// Push a byte to the output buffer and trigger interrupt if data was added.
+    /// Update output-buffer status bits for the byte currently visible to the guest.
+    fn update_output_buffer_status(&mut self) {
+        if self.output_buffer.is_empty() {
+            self.status &= !(STATUS_OUTPUT_BUFFER_FULL | STATUS_AUX_OUTPUT_BUFFER_FULL);
+        } else {
+            self.status |= STATUS_OUTPUT_BUFFER_FULL;
+            if self.output_buffer_aux.front().copied().unwrap_or(false) {
+                self.status |= STATUS_AUX_OUTPUT_BUFFER_FULL;
+            } else {
+                self.status &= !STATUS_AUX_OUTPUT_BUFFER_FULL;
+            }
+        }
+    }
+
+    fn trigger_output_irq(&self) {
+        let (irq_enabled, irq) = if self.output_buffer_aux.front().copied().unwrap_or(false) {
+            (
+                self.ctr & (CTR_AUX_INT | CTR_AUX_DISABLE) == CTR_AUX_INT,
+                &self.mouse_irq,
+            )
+        } else {
+            (
+                self.ctr & (CTR_KBD_INT | CTR_KBD_DISABLE) == CTR_KBD_INT,
+                &self.keyboard_irq,
+            )
+        };
+
+        if irq_enabled && let Some(irq) = irq {
+            if let Err(error) = irq.trigger(0) {
+                warn!("i8042: failed to trigger IRQ: {error}");
+            }
+        }
+    }
+
+    /// Push a byte to the output buffer and trigger the matching IRQ if data was added.
     fn push_output(&mut self, byte: u8) {
+        self.push_output_with_source(byte, false);
+    }
+
+    /// Push a byte from the auxiliary mouse port to the output buffer.
+    fn push_aux_output(&mut self, byte: u8) {
+        self.push_output_with_source(byte, true);
+    }
+
+    fn push_output_with_source(&mut self, byte: u8, aux: bool) {
         if self.output_buffer.len() < MAX_DATA_BUFFER {
-            // Only trigger IRQ when buffer transitions from empty to non-empty
             let was_empty = self.output_buffer.is_empty();
             self.output_buffer.push_back(byte);
-            self.status |= STATUS_OUTPUT_BUFFER_FULL;
+            self.output_buffer_aux.push_back(aux);
             if was_empty {
-                if let Some(ref irq) = self.irq {
-                    if let Err(e) = irq.trigger(0) {
-                        warn!("i8042: failed to trigger IRQ: {e}");
-                    }
-                }
+                self.update_output_buffer_status();
+                self.trigger_output_irq();
             }
         } else {
             debug!("i8042: output buffer full, dropping byte 0x{byte:02x}");
@@ -390,12 +581,18 @@ impl I8042Device {
         // TigerVNC resends "down" events on autorepeat; we only want one down + one up.
         if let Some(currently_down) = self.pressed_keys.get(&key).map(|&(down, _)| down) {
             if currently_down == pressed {
-                info!("i8042: filtering duplicate keysym=0x{:x} pressed={}", key, pressed);
+                info!(
+                    "i8042: filtering duplicate keysym=0x{:x} pressed={}",
+                    key, pressed
+                );
                 return false;
             }
         }
 
-        let scan_codes = KeyboardMap::scan_codes(key, pressed);
+        // VNC input is injected after the controller's translation stage.  It
+        // therefore has to match the format currently visible at port 0x60.
+        let send_set1 = self.ctr & CTR_XLATE != 0 || self.keyboard_scancode_set == 1;
+        let scan_codes = KeyboardMap::scan_codes(key, pressed, send_set1);
         if !scan_codes.is_empty() {
             self.pressed_keys.insert(key, (pressed, Instant::now()));
             info!(
@@ -412,44 +609,61 @@ impl I8042Device {
 
     /// Push bytes to output buffer without triggering IRQ.
     fn push_output_bytes_no_irq(&mut self, bytes: &[u8]) {
+        self.push_output_bytes_no_irq_with_source(bytes, false);
+    }
+
+    /// Push auxiliary bytes to the output buffer without triggering an IRQ.
+    fn push_aux_output_bytes_no_irq(&mut self, bytes: &[u8]) {
+        self.push_output_bytes_no_irq_with_source(bytes, true);
+    }
+
+    fn push_output_bytes_no_irq_with_source(&mut self, bytes: &[u8], aux: bool) {
         for &b in bytes {
             if self.output_buffer.len() < MAX_DATA_BUFFER {
                 self.output_buffer.push_back(b);
-                self.status |= STATUS_OUTPUT_BUFFER_FULL;
+                self.output_buffer_aux.push_back(aux);
             }
         }
+        self.update_output_buffer_status();
     }
 
     /// Process a mouse input event and generate a 3-byte mouse packet.
     ///
     /// Standard PS/2 mouse packet format:
-    /// Byte 0: bits 0-2 = buttons (L, R, M), bit 3 = Y overflow, bit 4 = X overflow,
-    ///         bit 5 = Y sign, bit 6 = X sign, bit 7 = 1 (always)
+    /// Byte 0: bits 0-2 = buttons (L, R, M), bit 3 = 1 (always), bit 4 = X sign,
+    ///         bit 5 = Y sign, bit 6 = X overflow, bit 7 = Y overflow
     /// Byte 1: X movement (signed, 8-bit with overflow flag)
     /// Byte 2: Y movement (signed, 8-bit with overflow flag)
-    fn process_mouse_event(&mut self, buttons: u8, dx: i16, dy: i16) {
-        if !self.mouse_enabled {
-            return;
+    pub fn process_mouse_event(&mut self, buttons: u8, dx: i16, dy: i16) -> bool {
+        if !self.mouse_enabled || !self.mouse_reporting_enabled {
+            return false;
+        }
+        if self.output_buffer.len() > MAX_DATA_BUFFER - 3 {
+            debug!("i8042: output buffer full, dropping mouse packet");
+            return false;
         }
 
-        let mut byte0 = 0x80;
+        let mut byte0 = 0x08;
         byte0 |= buttons & 0x07;
 
         let (x_byte, x_overflow) = clamp_to_i8(dx);
         let (y_byte, y_overflow) = clamp_to_i8(dy);
 
         if x_overflow {
-            byte0 |= 0x10;
+            byte0 |= 0x40;
         }
         if y_overflow {
-            byte0 |= 0x08;
+            byte0 |= 0x80;
         }
-        byte0 |= ((x_byte as u8 >> 7) & 0x01) << 6;
-        byte0 |= ((y_byte as u8 >> 7) & 0x01) << 5;
+        if x_byte.is_negative() {
+            byte0 |= 0x10;
+        }
+        if y_byte.is_negative() {
+            byte0 |= 0x20;
+        }
 
-        self.push_output(byte0);
-        self.push_output(x_byte as u8);
-        self.push_output(y_byte as u8);
+        self.push_aux_output_bytes_no_irq(&[byte0, x_byte as u8, y_byte as u8]);
+        true
     }
 
     /// Drain pending input events from the input channel.
@@ -498,29 +712,28 @@ impl I8042Device {
                 debug!("i8042: keyboard disabled");
                 self.keyboard_enabled = false;
                 self.port_a &= !0x01;
-                self.push_output(0xFA);
+                self.ctr |= CTR_KBD_DISABLE;
             }
             CMD_ENABLE_KEYBOARD => {
                 debug!("i8042: keyboard enabled");
                 self.keyboard_enabled = true;
                 self.port_a |= 0x01;
-                self.push_output(0xFA);
+                self.ctr &= !CTR_KBD_DISABLE;
             }
             CMD_DISABLE_SECONDARY => {
                 debug!("i8042: mouse/secondary disabled");
                 self.mouse_enabled = false;
                 self.port_a &= !0x10;
-                self.push_output(0xFA);
+                self.ctr |= CTR_AUX_DISABLE;
             }
             CMD_ENABLE_SECONDARY => {
                 debug!("i8042: mouse/secondary enabled");
                 self.mouse_enabled = true;
                 self.port_a |= 0x10;
-                self.push_output(0xFA);
+                self.ctr &= !CTR_AUX_DISABLE;
             }
             CMD_TEST_KEYBOARD => {
-                self.push_output(0xFA);
-                self.push_output(0x55);
+                self.push_output(0x00);
             }
             CMD_READ_PORT_A => {
                 // Linux uses 0x20 to read the CTR during i8042 initialization.
@@ -531,35 +744,29 @@ impl I8042Device {
             }
             CMD_WRITE_PORT_A => {
                 self.pending_command = Some(cmd);
-                self.push_output(0xFA);
             }
-            CMD_PULSE_INTERRUPT => {
-                self.push_output(0xFA);
+            CMD_TEST_SECONDARY => {
+                // The auxiliary-port self test succeeds, allowing the guest to
+                // discover the PS/2 mouse before issuing device commands.
+                self.push_output(0x00);
             }
             CMD_READ_PORT_B => {
                 self.push_output(self.port_b);
             }
             CMD_READ_KBD_INPUT => {
-                if let Some(byte) = self.output_buffer.pop_front() {
-                    self.push_output(byte);
-                } else {
-                    self.push_output(0x00);
-                }
+                self.push_output(self.control_reg);
             }
             CMD_WRITE_KBD_OUTPUT => {
                 self.pending_command = Some(cmd);
-                self.push_output(0xFA);
             }
             CMD_WRITE_SECONDARY_OUTPUT => {
                 self.pending_command = Some(cmd);
-                self.push_output(0xFA);
             }
-            CMD_READ_KBD_CTRL => {
-                self.push_output(self.control_reg);
+            CMD_WRITE_TO_AUX => {
+                self.pending_command = Some(cmd);
             }
             CMD_WRITE_KBD_CTRL => {
                 self.pending_command = Some(cmd);
-                self.push_output(0xFA);
             }
             _ => {
                 warn!("i8042: unknown command 0x{cmd:02x}");
@@ -573,50 +780,161 @@ impl I8042Device {
         if let Some(cmd) = self.pending_command {
             match cmd {
                 CMD_WRITE_KBD_OUTPUT => {
-                    // Emulate keyboard response for GET_ID (0xF2)
-                    if data == 0xF2 {
-                        self.push_output(0xFA);
-                        self.push_output(0xAB);
-                        self.push_output(0x83);
-                    }
+                    self.push_output(data);
                 }
                 CMD_WRITE_SECONDARY_OUTPUT => {
-                    // Forward data to mouse/secondary interface (no echo to output buffer)
+                    self.push_aux_output(data);
+                }
+                CMD_WRITE_TO_AUX => {
+                    self.handle_mouse_command(data);
                 }
                 CMD_WRITE_PORT_A => {
-                    self.port_a = data;
+                    self.ctr = data;
                 }
                 CMD_WRITE_KBD_CTRL => {
-                    // Bit 6 = keylock, bit 1 = translate, bit 2/3 = IRQ enable
                     self.control_reg = data;
                 }
                 _ => {}
             }
             self.pending_command = None;
         } else {
-            // Direct keyboard command (e.g., 0xF2 = GET_ID, 0xED = SET LED)
-            if data == 0xF2 && self.keyboard_enabled {
-                // Emulate AT keyboard GET_ID response
+            self.handle_keyboard_command(data);
+        }
+    }
+
+    fn handle_keyboard_command(&mut self, command: u8) {
+        if let Some(pending_command) = self.pending_keyboard_command.take() {
+            self.push_output(0xFA);
+            if pending_command == 0xF0 {
+                if command == 0 {
+                    self.push_output(self.keyboard_scancode_set);
+                } else if (1..=3).contains(&command) {
+                    self.keyboard_scancode_set = command;
+                }
+            }
+            return;
+        }
+
+        match command {
+            // Set LEDs, typematic rate, and scan-code set each take one parameter.
+            0xED | 0xF0 | 0xF3 => {
+                self.pending_keyboard_command = Some(command);
+                self.push_output(0xFA);
+            }
+            // Reset returns ACK followed by the keyboard self-test result.
+            0xFF => {
+                self.keyboard_enabled = true;
+                self.push_output(0xFA);
+                self.push_output(0xAA);
+            }
+            // Identify an AT-compatible keyboard.
+            0xF2 => {
                 self.push_output(0xFA);
                 self.push_output(0xAB);
                 self.push_output(0x83);
-            } else if data == 0xED && self.keyboard_enabled {
-                // SET LED command - acknowledge, parameter follows
-                self.push_output(0xFA);
-            } else if data == 0xF4 {
-                // ENABLE typing - acknowledge and enable keyboard data
-                debug!("i8042: keyboard enabled (0xF4)");
+            }
+            0xF4 => {
                 self.keyboard_enabled = true;
-                self.port_a |= 0x01;
                 self.push_output(0xFA);
-            } else if data == 0xF5 {
-                // DISABLE typing (reset to defaults and disable) - acknowledge
-                debug!("i8042: keyboard disabled (0xF5)");
+            }
+            0xF5 | 0xF6 => {
                 self.keyboard_enabled = false;
-                self.port_a &= !0x01;
                 self.push_output(0xFA);
-            } else {
-                self.input_buffer = Some(data);
+            }
+            // Echo is used by some firmware probes.
+            0xEE => self.push_output(0xEE),
+            _ => {
+                debug!("i8042: unimplemented keyboard command 0x{command:02x}");
+                self.push_output(0xFA);
+            }
+        }
+    }
+
+    fn handle_mouse_command(&mut self, command: u8) {
+        if let Some(pending_command) = self.pending_mouse_command.take() {
+            self.push_aux_output(0xFA);
+            match pending_command {
+                0xE8 => self.mouse_resolution = command & 0x03,
+                0xF3 => self.mouse_sample_rate = command,
+                _ => unreachable!("only mouse commands with a parameter are pending"),
+            }
+            return;
+        }
+
+        match command {
+            // Set resolution and sample rate each take one parameter.
+            0xE8 | 0xF3 => {
+                self.pending_mouse_command = Some(command);
+                self.push_aux_output(0xFA);
+            }
+            // Set scaling. The standard mouse uses 1:1 scaling by default;
+            // no packet conversion is needed for the relative VNC events.
+            0xE6 => {
+                self.mouse_scaling_21 = false;
+                self.push_aux_output(0xFA);
+            }
+            0xE7 => {
+                self.mouse_scaling_21 = true;
+                self.push_aux_output(0xFA);
+            }
+            // Get status: ACK, status flags, resolution, and sample rate.
+            // psmouse uses this during its standard-device probe.
+            0xE9 => {
+                let status = (u8::from(self.mouse_reporting_enabled) << 5)
+                    | (u8::from(self.mouse_scaling_21) << 4);
+                self.push_aux_output(0xFA);
+                self.push_aux_output(status);
+                self.push_aux_output(self.mouse_resolution);
+                self.push_aux_output(self.mouse_sample_rate);
+            }
+            // Select stream mode. This is the normal operating mode.
+            0xEA => self.push_aux_output(0xFA),
+            // Poll requests one packet even while reporting is disabled.
+            0xEB => {
+                self.push_aux_output(0xFA);
+                self.push_aux_output(0x08);
+                self.push_aux_output(0x00);
+                self.push_aux_output(0x00);
+            }
+            // Reset wrap mode and echo are used by generic PS/2 probes.
+            0xEC => self.push_aux_output(0xFA),
+            0xEE => self.push_aux_output(0xEE),
+            0xF0 => self.push_aux_output(0xFA),
+            // Set defaults and disable data reporting.
+            0xF6 => {
+                self.mouse_reporting_enabled = false;
+                self.mouse_resolution = 2;
+                self.mouse_sample_rate = 100;
+                self.mouse_scaling_21 = false;
+                self.push_aux_output(0xFA);
+            }
+            // Enable/disable data reporting.
+            0xF4 => {
+                self.mouse_reporting_enabled = true;
+                self.push_aux_output(0xFA);
+            }
+            0xF5 => {
+                self.mouse_reporting_enabled = false;
+                self.push_aux_output(0xFA);
+            }
+            // Get device ID for a standard three-button PS/2 mouse.
+            0xF2 => {
+                self.push_aux_output(0xFA);
+                self.push_aux_output(0x00);
+            }
+            // Reset returns ACK, self-test pass, and the standard device ID.
+            0xFF => {
+                self.mouse_reporting_enabled = false;
+                self.mouse_resolution = 2;
+                self.mouse_sample_rate = 100;
+                self.mouse_scaling_21 = false;
+                self.push_aux_output(0xFA);
+                self.push_aux_output(0xAA);
+                self.push_aux_output(0x00);
+            }
+            _ => {
+                debug!("i8042: unimplemented mouse command 0x{command:02x}");
+                self.push_aux_output(0xFA);
             }
         }
     }
@@ -650,15 +968,13 @@ impl BusDevice for I8042Device {
             OFFSET_DATA => {
                 self.drain_input_channel();
                 if let Some(byte) = self.output_buffer.pop_front() {
+                    self.output_buffer_aux.pop_front();
                     data[0] = byte;
                     debug!("i8042: guest read 0x{byte:02x}");
-                    if self.output_buffer.is_empty() {
-                        self.status &= !STATUS_OUTPUT_BUFFER_FULL;
-                    } else {
-                        // More data available, trigger another IRQ
-                        if let Some(ref irq) = self.irq {
-                            let _ = irq.trigger(0);
-                        }
+                    self.update_output_buffer_status();
+                    if !self.output_buffer.is_empty() {
+                        // More data is available from the source at the front of the queue.
+                        self.trigger_output_irq();
                     }
                 } else {
                     data[0] = 0xFF;
@@ -706,7 +1022,10 @@ impl BusDevice for I8042Device {
                 self.handle_command(data[0]);
             }
             _ => {
-                debug!("i8042: write to unknown offset {}: 0x{:02x}", offset, data[0]);
+                debug!(
+                    "i8042: write to unknown offset {}: 0x{:02x}",
+                    offset, data[0]
+                );
             }
         }
 
@@ -725,17 +1044,25 @@ mod tests {
             vcpus_pause_signalled: Arc::new(AtomicBool::new(false)),
             status: STATUS_SYSTEM_FLAG | STATUS_KEYLOCK,
             output_buffer: VecDeque::new(),
-            input_buffer: None,
+            output_buffer_aux: VecDeque::new(),
             port_a: 0x00,
             port_b: 0x20,
-            ctr: CTR_XLATE,
+            ctr: CTR_KBD_INT | CTR_AUX_INT | CTR_SYSTEM_FLAG | CTR_XLATE,
             control_reg: 0x00,
             keyboard_enabled: true,
+            keyboard_scancode_set: 2,
             pressed_keys: HashMap::new(),
             mouse_enabled: true,
+            mouse_reporting_enabled: false,
+            mouse_resolution: 2,
+            mouse_sample_rate: 100,
+            mouse_scaling_21: false,
             pending_command: None,
+            pending_mouse_command: None,
+            pending_keyboard_command: None,
             input_channel: None,
-            irq: None,
+            keyboard_irq: None,
+            mouse_irq: None,
         }
     }
 
@@ -771,14 +1098,12 @@ mod tests {
         dev.write(0, OFFSET_COMMAND, &[CMD_DISABLE_KEYBOARD]);
         assert!(!dev.keyboard_enabled);
         assert_eq!(dev.port_a & 0x01, 0);
-
-        let mut data = [0u8];
-        dev.read(0, OFFSET_DATA, &mut data);
-        assert_eq!(data[0], 0xFA);
+        assert_ne!(dev.ctr & CTR_KBD_DISABLE, 0);
 
         dev.write(0, OFFSET_COMMAND, &[CMD_ENABLE_KEYBOARD]);
         assert!(dev.keyboard_enabled);
         assert_eq!(dev.port_a & 0x01, 0x01);
+        assert_eq!(dev.ctr & CTR_KBD_DISABLE, 0);
     }
 
     #[test]
@@ -791,7 +1116,6 @@ mod tests {
         // 0xF5 = DISABLE typing (atkbd_deactivate)
         dev.write(0, OFFSET_DATA, &[0xF5]);
         assert!(!dev.keyboard_enabled);
-        assert_eq!(dev.port_a & 0x01, 0);
 
         let mut data = [0u8];
         dev.read(0, OFFSET_DATA, &mut data);
@@ -800,7 +1124,6 @@ mod tests {
         // 0xF4 = ENABLE typing (atkbd_activate)
         dev.write(0, OFFSET_DATA, &[0xF4]);
         assert!(dev.keyboard_enabled);
-        assert_eq!(dev.port_a & 0x01, 0x01);
 
         dev.read(0, OFFSET_DATA, &mut data);
         assert_eq!(data[0], 0xFA); // keyboard ACK
@@ -817,6 +1140,57 @@ mod tests {
         dev.write(0, OFFSET_COMMAND, &[CMD_ENABLE_SECONDARY]);
         assert!(dev.mouse_enabled);
         assert_eq!(dev.port_a & 0x10, 0x10);
+    }
+
+    #[test]
+    fn test_mouse_port_self_test() {
+        let mut dev = make_device();
+
+        dev.write(0, OFFSET_COMMAND, &[CMD_TEST_SECONDARY]);
+
+        let mut data = [0u8];
+        dev.read(0, OFFSET_DATA, &mut data);
+        assert_eq!(data[0], 0x00);
+    }
+
+    #[test]
+    fn test_keyboard_port_self_test() {
+        let mut dev = make_device();
+
+        dev.write(0, OFFSET_COMMAND, &[CMD_TEST_KEYBOARD]);
+
+        let mut data = [0u8];
+        dev.read(0, OFFSET_DATA, &mut data);
+        assert_eq!(data[0], 0x00);
+    }
+
+    #[test]
+    fn test_keyboard_reset() {
+        let mut dev = make_device();
+
+        dev.write(0, OFFSET_DATA, &[0xFF]);
+
+        let mut data = [0u8];
+        dev.read(0, OFFSET_DATA, &mut data);
+        assert_eq!(data[0], 0xFA);
+        dev.read(0, OFFSET_DATA, &mut data);
+        assert_eq!(data[0], 0xAA);
+    }
+
+    #[test]
+    fn test_keyboard_scan_code_set_query() {
+        let mut dev = make_device();
+
+        dev.write(0, OFFSET_DATA, &[0xF0]);
+        dev.write(0, OFFSET_DATA, &[0x00]);
+
+        let mut data = [0u8];
+        dev.read(0, OFFSET_DATA, &mut data);
+        assert_eq!(data[0], 0xFA);
+        dev.read(0, OFFSET_DATA, &mut data);
+        assert_eq!(data[0], 0xFA);
+        dev.read(0, OFFSET_DATA, &mut data);
+        assert_eq!(data[0], 0x02);
     }
 
     #[test]
@@ -866,6 +1240,24 @@ mod tests {
     }
 
     #[test]
+    fn test_keyboard_uses_set2_when_translation_is_disabled() {
+        let mut dev = make_device();
+        dev.ctr &= !CTR_XLATE;
+
+        // q: set 2 make 0x15 and break 0xf0, 0x15.
+        dev.process_keyboard_event(0x71, true);
+        dev.process_keyboard_event(0x71, false);
+        assert_eq!(dev.output_buffer, VecDeque::from([0x15, 0xF0, 0x15]));
+
+        // The dedicated cursor keys retain their E0 prefix in set 2.
+        dev.process_keyboard_event(0xFF52, true);
+        assert_eq!(
+            dev.output_buffer,
+            VecDeque::from([0x15, 0xF0, 0x15, 0xE0, 0x75])
+        );
+    }
+
+    #[test]
     fn test_extended_keyboard_scan_codes() {
         let mut dev = make_device();
 
@@ -891,26 +1283,36 @@ mod tests {
     #[test]
     fn test_mouse_packet() {
         let mut dev = make_device();
+        dev.mouse_reporting_enabled = true;
 
         dev.process_mouse_event(0x01, 10, -5);
 
         assert_eq!(dev.output_buffer.len(), 3);
         let packet = dev.output_buffer.make_contiguous();
-        assert_eq!(packet[0] & 0x80, 0x80);
+        assert_eq!(packet[0] & 0x08, 0x08);
         assert_eq!(packet[0] & 0x01, 0x01);
         assert_eq!(packet[1], 10);
         assert_eq!(packet[2], (-5i8) as u8);
+        assert!(dev.output_buffer_aux.iter().all(|&aux| aux));
+        assert_ne!(dev.status & STATUS_AUX_OUTPUT_BUFFER_FULL, 0);
+
+        let mut data = [0u8];
+        for _ in 0..3 {
+            dev.read(0, OFFSET_DATA, &mut data);
+        }
+        assert_eq!(dev.status & STATUS_AUX_OUTPUT_BUFFER_FULL, 0);
     }
 
     #[test]
     fn test_mouse_overflow() {
         let mut dev = make_device();
+        dev.mouse_reporting_enabled = true;
 
         dev.process_mouse_event(0x00, 300, 0);
 
         assert_eq!(dev.output_buffer.len(), 3);
         let packet = dev.output_buffer.make_contiguous();
-        assert_ne!(packet[0] & 0x10, 0);
+        assert_ne!(packet[0] & 0x40, 0);
         assert_eq!(packet[1], i8::MAX as u8);
     }
 
@@ -918,9 +1320,37 @@ mod tests {
     fn test_mouse_disabled() {
         let mut dev = make_device();
         dev.mouse_enabled = false;
+        dev.mouse_reporting_enabled = true;
 
         dev.process_mouse_event(0x01, 10, 5);
         assert_eq!(dev.output_buffer.len(), 0);
+    }
+
+    #[test]
+    fn test_mouse_enable_data_reporting() {
+        let mut dev = make_device();
+
+        dev.write(0, OFFSET_COMMAND, &[CMD_WRITE_TO_AUX]);
+        dev.write(0, OFFSET_DATA, &[0xF4]);
+        assert!(dev.mouse_reporting_enabled);
+        assert_eq!(dev.output_buffer, VecDeque::from([0xFA]));
+        assert_eq!(dev.output_buffer_aux, VecDeque::from([true]));
+
+        dev.output_buffer.clear();
+        dev.output_buffer_aux.clear();
+        dev.process_mouse_event(0, 1, 1);
+        assert_eq!(dev.output_buffer.len(), 3);
+    }
+
+    #[test]
+    fn test_mouse_get_status() {
+        let mut dev = make_device();
+
+        dev.write(0, OFFSET_COMMAND, &[CMD_WRITE_TO_AUX]);
+        dev.write(0, OFFSET_DATA, &[0xE9]);
+
+        assert_eq!(dev.output_buffer, VecDeque::from([0xFA, 0x00, 0x02, 100]));
+        assert!(dev.output_buffer_aux.iter().all(|&aux| aux));
     }
 
     #[test]
@@ -955,13 +1385,11 @@ mod tests {
         let mut dev = make_device();
 
         dev.write(0, OFFSET_COMMAND, &[CMD_WRITE_KBD_OUTPUT]);
+        dev.write(0, OFFSET_DATA, &[0x55]);
+
         let mut data = [0u8];
         dev.read(0, OFFSET_DATA, &mut data);
-        assert_eq!(data[0], 0xFA);
-
-        // Data is forwarded to keyboard interface, not echoed to output buffer
-        dev.write(0, OFFSET_DATA, &[0x55]);
-        assert_eq!(dev.output_buffer.len(), 0);
+        assert_eq!(data[0], 0x55);
     }
 
     #[test]
@@ -969,13 +1397,11 @@ mod tests {
         let mut dev = make_device();
 
         dev.write(0, OFFSET_COMMAND, &[CMD_WRITE_SECONDARY_OUTPUT]);
+        dev.write(0, OFFSET_DATA, &[0xAA]);
+
         let mut data = [0u8];
         dev.read(0, OFFSET_DATA, &mut data);
-        assert_eq!(data[0], 0xFA);
-
-        // Data is forwarded to mouse interface, not echoed to output buffer
-        dev.write(0, OFFSET_DATA, &[0xAA]);
-        assert_eq!(dev.output_buffer.len(), 0);
+        assert_eq!(data[0], 0xAA);
     }
 
     #[test]

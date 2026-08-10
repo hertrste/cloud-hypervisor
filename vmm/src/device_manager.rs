@@ -1230,6 +1230,29 @@ fn use_64bit_bar_for_virtio_device(
     pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32 || is_hotplug
 }
 
+#[cfg(feature = "fw_cfg")]
+fn forward_vnc_mouse_event(
+    i8042: &Arc<Mutex<devices::legacy::I8042Device>>,
+    mouse_irq: &Option<Arc<dyn vm_device::interrupt::InterruptSourceGroup>>,
+    buttons: u8,
+    dx: i16,
+    dy: i16,
+) {
+    // Reserve room for the three-byte PS/2 packet before generating it.
+    if i8042.lock().unwrap().output_buffer_near_full() {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let need_irq = i8042.lock().unwrap().process_mouse_event(buttons, dx, dy);
+    if need_irq {
+        if let Some(irq) = mouse_irq {
+            if let Err(error) = irq.trigger(0) {
+                warn!("vnc-bridge: failed to trigger mouse IRQ: {error}");
+            }
+        }
+    }
+}
+
 impl DeviceManager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1736,11 +1759,14 @@ impl DeviceManager {
         // Spawn bridge thread to forward VNC input events to i8042
         if let Some(i8042) = self.i8042.as_ref() {
             let i8042: Arc<Mutex<devices::legacy::I8042Device>> = Arc::clone(i8042);
-            // Get IRQ for triggering after releasing i8042 lock
-            let irq = i8042.lock().unwrap().irq();
+            // Get IRQs for triggering after releasing the i8042 lock.
+            let keyboard_irq = i8042.lock().unwrap().keyboard_irq();
+            let mouse_irq = i8042.lock().unwrap().mouse_irq();
             let bridge_handle = std::thread::Builder::new()
                 .name("ch-vnc-bridge".to_string())
                 .spawn(move || {
+                    let mut mouse_buttons = 0u8;
+                    let mut last_pointer_position = None;
                     for event in input_receiver.iter() {
                         match event {
                             display::vnc::VncInputEvent::Keyboard { key, down } => {
@@ -1757,7 +1783,7 @@ impl DeviceManager {
                                 };
                                 // Lock is now dropped, vCPU can read data port
                                 if need_irq {
-                                    if let Some(ref irq) = irq {
+                                    if let Some(ref irq) = keyboard_irq {
                                         if let Err(e) = irq.trigger(0) {
                                             warn!("vnc-bridge: failed to trigger IRQ: {e}");
                                         } else {
@@ -1768,14 +1794,68 @@ impl DeviceManager {
                                     }
                                 }
                             }
-                            display::vnc::VncInputEvent::MouseButton { .. } => {
-                                // Mouse not yet wired
+                            display::vnc::VncInputEvent::MouseButton { button, down } => {
+                                let button_mask = match button {
+                                    0 => 0x01, // VNC left -> PS/2 left
+                                    1 => 0x04, // VNC middle -> PS/2 middle
+                                    2 => 0x02, // VNC right -> PS/2 right
+                                    _ => continue,
+                                };
+                                let new_buttons = if down {
+                                    mouse_buttons | button_mask
+                                } else {
+                                    mouse_buttons & !button_mask
+                                };
+                                if new_buttons != mouse_buttons {
+                                    mouse_buttons = new_buttons;
+                                    forward_vnc_mouse_event(
+                                        &i8042,
+                                        &mouse_irq,
+                                        mouse_buttons,
+                                        0,
+                                        0,
+                                    );
+                                }
                             }
-                            display::vnc::VncInputEvent::PointerMove { .. } => {
-                                // Mouse not yet wired
+                            display::vnc::VncInputEvent::PointerMove { dx, dy } => {
+                                forward_vnc_mouse_event(
+                                    &i8042,
+                                    &mouse_irq,
+                                    mouse_buttons,
+                                    dx,
+                                    dy,
+                                );
                             }
-                            display::vnc::VncInputEvent::PointerPosition { .. } => {
-                                // Not used
+                            display::vnc::VncInputEvent::PointerPosition { x, y } => {
+                                if let Some((previous_x, previous_y)) = last_pointer_position {
+                                    let dx = i16::try_from(x as i64 - previous_x as i64)
+                                        .unwrap_or_else(|_| {
+                                            if x > previous_x {
+                                                i16::MAX
+                                            } else {
+                                                i16::MIN
+                                            }
+                                        });
+                                    // VNC uses a downward-positive Y axis, while PS/2 uses upward-positive.
+                                    let dy = i16::try_from(previous_y as i64 - y as i64)
+                                        .unwrap_or_else(|_| {
+                                            if y < previous_y {
+                                                i16::MAX
+                                            } else {
+                                                i16::MIN
+                                            }
+                                        });
+                                    if dx != 0 || dy != 0 {
+                                        forward_vnc_mouse_event(
+                                            &i8042,
+                                            &mouse_irq,
+                                            mouse_buttons,
+                                            dx,
+                                            dy,
+                                        );
+                                    }
+                                }
+                                last_pointer_position = Some((x, y));
                             }
                         }
                     }
@@ -2226,11 +2306,15 @@ impl DeviceManager {
             .unwrap()
             .vcpus_pause_signalled()
             .clone();
-        // Add a shutdown device (i8042) with PS/2 keyboard/mouse support
-        // IRQ 1 is the standard PS/2 keyboard IRQ
-        let i8042_irq = legacy_interrupt_manager
+        // Add a shutdown device (i8042) with PS/2 keyboard/mouse support.
+        let keyboard_irq = legacy_interrupt_manager
             .create_group(LegacyIrqGroupConfig {
                 irq: 1,
+            })
+            .ok();
+        let mouse_irq = legacy_interrupt_manager
+            .create_group(LegacyIrqGroupConfig {
+                irq: 12,
             })
             .ok();
         #[cfg(feature = "fw_cfg")]
@@ -2239,7 +2323,8 @@ impl DeviceManager {
             vcpus_kill_signalled.clone(),
             vcpus_pause_signalled.clone(),
             self.input_channel.as_ref().map(Arc::clone),
-            i8042_irq,
+            keyboard_irq,
+            mouse_irq,
         )));
         #[cfg(not(feature = "fw_cfg"))]
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
@@ -2247,7 +2332,8 @@ impl DeviceManager {
             vcpus_kill_signalled.clone(),
             vcpus_pause_signalled.clone(),
             None,
-            i8042_irq,
+            keyboard_irq,
+            mouse_irq,
         )));
 
         {

@@ -2,8 +2,7 @@ use std::io::{Read, Result, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +11,114 @@ use log::{debug, error, info, warn};
 use crate::framebuffer::FramebufferSurface;
 
 const MAX_CLIENT_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PixelFormat {
+    bits_per_pixel: u8,
+    depth: u8,
+    big_endian: bool,
+    red_max: u16,
+    green_max: u16,
+    blue_max: u16,
+    red_shift: u8,
+    green_shift: u8,
+    blue_shift: u8,
+}
+
+const XRGB8888_FORMAT: PixelFormat = PixelFormat {
+    bits_per_pixel: 32,
+    depth: 24,
+    big_endian: false,
+    red_max: 255,
+    green_max: 255,
+    blue_max: 255,
+    red_shift: 16,
+    green_shift: 8,
+    blue_shift: 0,
+};
+
+impl PixelFormat {
+    fn from_set_pixel_format(message: &[u8]) -> Result<Self> {
+        let format = Self {
+            bits_per_pixel: message[4],
+            depth: message[5],
+            big_endian: message[6] != 0,
+            red_max: u16::from_be_bytes([message[8], message[9]]),
+            green_max: u16::from_be_bytes([message[10], message[11]]),
+            blue_max: u16::from_be_bytes([message[12], message[13]]),
+            red_shift: message[14],
+            green_shift: message[15],
+            blue_shift: message[16],
+        };
+
+        if message[7] == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "color-map pixel formats are not supported",
+            ));
+        }
+        if !matches!(format.bits_per_pixel, 8 | 16 | 32)
+            || format.depth == 0
+            || format.depth > format.bits_per_pixel
+            || format.red_max == 0
+            || format.green_max == 0
+            || format.blue_max == 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid true-color pixel format",
+            ));
+        }
+
+        let pixel_mask = if format.bits_per_pixel == 32 {
+            u64::from(u32::MAX)
+        } else {
+            (1u64 << format.bits_per_pixel) - 1
+        };
+        let masks = [
+            u64::from(format.red_max) << format.red_shift,
+            u64::from(format.green_max) << format.green_shift,
+            u64::from(format.blue_max) << format.blue_shift,
+        ];
+        if masks.iter().any(|mask| mask & !pixel_mask != 0)
+            || masks[0] & masks[1] != 0
+            || masks[0] & masks[2] != 0
+            || masks[1] & masks[2] != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pixel format color fields overlap or exceed the pixel size",
+            ));
+        }
+
+        Ok(format)
+    }
+
+    fn bytes_per_pixel(self) -> usize {
+        usize::from(self.bits_per_pixel / 8)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FramebufferUpdateRequest {
+    incremental: bool,
+}
+
+struct ClientState {
+    pixel_format: PixelFormat,
+    framebuffer_request: Option<FramebufferUpdateRequest>,
+    pointer_button_mask: u8,
+}
+
+impl Default for ClientState {
+    fn default() -> Self {
+        Self {
+            pixel_format: XRGB8888_FORMAT,
+            framebuffer_request: None,
+            pointer_button_mask: 0,
+        }
+    }
+}
 
 /// VNC input event types
 #[derive(Debug, Clone)]
@@ -158,9 +265,11 @@ impl VncServer {
         let config = self.config.clone();
         let input_sender = self.input_sender.clone();
         let running = Arc::clone(&self.running);
-        let on_disconnect = self.on_disconnect.lock().map_err(|e| {
-            std::io::Error::other(format!("mutex poisoned: {e}"))
-        })?.take();
+        let on_disconnect = self
+            .on_disconnect
+            .lock()
+            .map_err(|e| std::io::Error::other(format!("mutex poisoned: {e}")))?
+            .take();
 
         self.running.store(true, Ordering::SeqCst);
 
@@ -235,13 +344,7 @@ fn run_vnc_server(
         match listener.accept() {
             Ok((stream, peer)) => {
                 info!("vnc: client connected from {peer}");
-                match handle_client(
-                    stream,
-                    &surface,
-                    &input_sender,
-                    &running,
-                    &on_disconnect,
-                ) {
+                match handle_client(stream, &surface, &input_sender, &running, &on_disconnect) {
                     Ok(()) => info!("vnc: client disconnected from {peer}"),
                     Err(e) => warn!("vnc: handle_client error from {peer}: {e}"),
                 }
@@ -290,24 +393,11 @@ fn handle_client(
 
     info!("vnc: client authenticated and connected");
 
-    // Send initial framebuffer update immediately so the client knows the display is alive.
-    // Many VNC clients (e.g., TigerVNC) throttle keyboard/mouse input until they receive
-    // at least one FBU, assuming the display is frozen otherwise.
-    let mut last_data: Option<Vec<u8>> = {
-        let mut s = stream.lock().unwrap();
-        if let Some(init_data) = surface.read_framebuffer() {
-            if send_framebuffer_update(&mut *s, &init_data, surface.config().width, surface.config().height).is_ok() {
-                info!("vnc: sent initial framebuffer update");
-                Some(init_data)
-            } else {
-                warn!("vnc: failed to send initial framebuffer update");
-                None
-            }
-        } else {
-            warn!("vnc: read_framebuffer returned None during initial update");
-            None
-        }
-    };
+    // RFB framebuffer updates are sent in response to client requests. Waiting
+    // for the first request also lets the client select its pixel format before
+    // any pixel data is transmitted.
+    let mut last_data: Option<Vec<u8>> = None;
+    let mut client_state = ClientState::default();
 
     let fb_interval = Duration::from_millis(40); // 25 FPS for framebuffer updates
     let input_interval = Duration::from_millis(100); // 10 Hz for input polling
@@ -342,14 +432,16 @@ fn handle_client(
                 // Keep non-blocking. Incomplete RFB messages remain buffered until
                 // the rest of the message arrives.
                 info!("vnc: socket readable, draining input");
-                if let Err(e) = check_client_input(&mut *s, input_sender, &mut input_buffer) {
-                    warn!("vnc: input read error: {}", e);
+                if let Err(e) =
+                    check_client_input(&mut *s, input_sender, &mut input_buffer, &mut client_state)
+                {
+                    return Err(e);
                 }
             }
 
             let mut fb_sent = false;
-            match surface.read_framebuffer() {
-                Some(current_data) => {
+            match (client_state.framebuffer_request, surface.read_framebuffer()) {
+                (Some(request), Some(current_data)) => {
                     let has_change = match &last_data {
                         None => true,
                         Some(prev) => prev != &current_data,
@@ -360,7 +452,7 @@ fn handle_client(
                         has_change
                     );
 
-                    if has_change {
+                    if has_change || !request.incremental {
                         // Check if socket is writable before sending FBU
                         let mut poll_out = libc::pollfd {
                             fd: s.as_raw_fd(),
@@ -373,35 +465,38 @@ fn handle_client(
                         } && (poll_out.revents & libc::POLLOUT) != 0;
 
                         if writable {
+                            let config = surface.config();
                             if send_framebuffer_update(
                                 &mut *s,
                                 &current_data,
-                                surface.config().width,
-                                surface.config().height,
+                                config.width,
+                                config.height,
+                                config.stride,
+                                client_state.pixel_format,
                             )
                             .is_err()
                             {
-                                warn!("vnc: failed to send framebuffer update, client disconnected");
+                                warn!(
+                                    "vnc: failed to send framebuffer update, client disconnected"
+                                );
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::BrokenPipe,
                                     "Client disconnected",
                                 ));
                             } else {
                                 last_data = Some(current_data);
+                                client_state.framebuffer_request = None;
                                 fb_sent = true;
                             }
                         }
                     }
                 }
-                None => {
+                (Some(_), None) => {
                     debug!("vnc: read_framebuffer returned None");
                 }
+                (None, _) => {}
             }
-            if fb_sent {
-                fb_interval
-            } else {
-                input_interval
-            }
+            if fb_sent { fb_interval } else { input_interval }
         }; // drop lock
 
         thread::sleep(sleep_duration);
@@ -456,7 +551,9 @@ fn security<RW: Read + Write>(rw: &mut RW, use_rfb38: bool) -> Result<()> {
         rw.write_all(&[1])?; // count = 1 (1 byte)
         rw.write_all(&[1])?; // type 1 = None (no authentication)
         rw.flush()?;
-        info!("vnc: sent RFB 3.8 security types (count=1, type=1=None), waiting for client response");
+        info!(
+            "vnc: sent RFB 3.8 security types (count=1, type=1=None), waiting for client response"
+        );
     } else {
         // RFB 3.3 security negotiation:
         // Server sends: 4-byte security type directly (no count byte)
@@ -471,7 +568,7 @@ fn security<RW: Read + Write>(rw: &mut RW, use_rfb38: bool) -> Result<()> {
 
     let mut selected = [0u8; 1];
     match rw.read_exact(&mut selected) {
-        Ok(()) => {},
+        Ok(()) => {}
         Err(e) => {
             info!("vnc: read_exact for security type failed: {e}");
             return Err(e);
@@ -552,15 +649,23 @@ fn send_framebuffer_update<W: Write>(
     data: &[u8],
     width: u32,
     height: u32,
+    stride: u32,
+    pixel_format: PixelFormat,
 ) -> Result<()> {
-    let bytes_per_pixel = 4u32;
-    let stride = width * bytes_per_pixel;
-    let fb_size = stride * height;
+    let source_row_size = width.checked_mul(4).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "framebuffer width overflow",
+        )
+    })?;
+    let fb_size = stride.checked_mul(height).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "framebuffer size overflow")
+    })?;
 
-    if data.len() < fb_size as usize {
+    if stride < source_row_size || data.len() < fb_size as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "Framebuffer data too small",
+            "framebuffer data is smaller than its dimensions and stride",
         ));
     }
 
@@ -571,22 +676,59 @@ fn send_framebuffer_update<W: Write>(
     writer.write_all(&[0, 1])?;
 
     // Rectangle: x, y, width, height (all CARD16), encoding (CARD32)
-    writer.write_all(&[0, 0])?;         // x = 0
-    writer.write_all(&[0, 0])?;         // y = 0
-    writer.write_all(&((width as u16).to_be_bytes()))?;    // width CARD16
-    writer.write_all(&((height as u16).to_be_bytes()))?;   // height CARD16
-    writer.write_all(&[0, 0, 0, 0])?;  // encoding = 0 (RAW)
+    writer.write_all(&[0, 0])?; // x = 0
+    writer.write_all(&[0, 0])?; // y = 0
+    writer.write_all(&((width as u16).to_be_bytes()))?; // width CARD16
+    writer.write_all(&((height as u16).to_be_bytes()))?; // height CARD16
+    writer.write_all(&[0, 0, 0, 0])?; // encoding = 0 (RAW)
 
-    writer.write_all(&data[..fb_size as usize])?;
+    let source_row_size = source_row_size as usize;
+    let stride = stride as usize;
+    for y in 0..height as usize {
+        let row = &data[y * stride..y * stride + source_row_size];
+        write_pixels(writer, row, pixel_format)?;
+    }
     writer.flush()?;
 
     Ok(())
+}
+
+fn write_pixels<W: Write>(writer: &mut W, source: &[u8], format: PixelFormat) -> Result<()> {
+    if format == XRGB8888_FORMAT {
+        return writer.write_all(source);
+    }
+
+    let mut converted = Vec::with_capacity(source.len() / 4 * format.bytes_per_pixel());
+    for pixel in source.chunks_exact(4) {
+        // DRM_FORMAT_XRGB8888 is stored as B, G, R, X on little-endian hosts.
+        let red = scale_color(pixel[2], format.red_max);
+        let green = scale_color(pixel[1], format.green_max);
+        let blue = scale_color(pixel[0], format.blue_max);
+        let value =
+            (red << format.red_shift) | (green << format.green_shift) | (blue << format.blue_shift);
+        let bytes = if format.big_endian {
+            value.to_be_bytes()
+        } else {
+            value.to_le_bytes()
+        };
+        if format.big_endian {
+            converted.extend_from_slice(&bytes[4 - format.bytes_per_pixel()..]);
+        } else {
+            converted.extend_from_slice(&bytes[..format.bytes_per_pixel()]);
+        }
+    }
+    writer.write_all(&converted)
+}
+
+fn scale_color(color: u8, maximum: u16) -> u32 {
+    (u32::from(color) * u32::from(maximum) + 127) / 255
 }
 
 fn check_client_input<R: Read>(
     reader: &mut R,
     input_sender: &mpsc::Sender<VncInputEvent>,
     input_buffer: &mut Vec<u8>,
+    client_state: &mut ClientState,
 ) -> Result<()> {
     let mut read_buffer = [0u8; 4096];
 
@@ -613,12 +755,13 @@ fn check_client_input<R: Read>(
         }
     }
 
-    drain_client_input(input_buffer, input_sender)
+    drain_client_input(input_buffer, input_sender, client_state)
 }
 
 fn drain_client_input(
     input_buffer: &mut Vec<u8>,
     input_sender: &mpsc::Sender<VncInputEvent>,
+    client_state: &mut ClientState,
 ) -> Result<()> {
     loop {
         let Some(message_size) = client_message_size(input_buffer)? else {
@@ -628,7 +771,7 @@ fn drain_client_input(
             return Ok(());
         }
 
-        handle_client_message(&input_buffer[..message_size], input_sender);
+        handle_client_message(&input_buffer[..message_size], input_sender, client_state)?;
         input_buffer.drain(..message_size);
     }
 }
@@ -639,8 +782,8 @@ fn client_message_size(input_buffer: &[u8]) -> Result<Option<usize>> {
     }
 
     let message_size = match input_buffer[0] {
-        // SetPixelFormat: type + padding + pixel format.
-        0 => 24,
+        // SetPixelFormat: type + 3 bytes padding + 16-byte pixel format.
+        0 => 20,
         // SetColorMapEntries: type + padding + first color + count + colors.
         1 => {
             if input_buffer.len() < 6 {
@@ -724,10 +867,16 @@ fn variable_message_size(header_size: usize, count: usize, item_size: usize) -> 
     Ok(message_size)
 }
 
-fn handle_client_message(message: &[u8], input_sender: &mpsc::Sender<VncInputEvent>) {
+fn handle_client_message(
+    message: &[u8],
+    input_sender: &mpsc::Sender<VncInputEvent>,
+    client_state: &mut ClientState,
+) -> Result<()> {
     match message[0] {
         0 => {
-            debug!("vnc: client sent SetPixelFormat");
+            let pixel_format = PixelFormat::from_set_pixel_format(message)?;
+            info!("vnc: client selected pixel format {pixel_format:?}");
+            client_state.pixel_format = pixel_format;
         }
         1 => {
             let first_idx = u16::from_be_bytes([message[2], message[3]]);
@@ -747,6 +896,7 @@ fn handle_client_message(message: &[u8], input_sender: &mpsc::Sender<VncInputEve
             debug!(
                 "vnc: FramebufferUpdateRequest incremental={incremental} x={x} y={y} width={width} height={height}"
             );
+            client_state.framebuffer_request = Some(FramebufferUpdateRequest { incremental });
         }
         4 => {
             let down = message[1] != 0;
@@ -760,18 +910,16 @@ fn handle_client_message(message: &[u8], input_sender: &mpsc::Sender<VncInputEve
             let x = u16::from_be_bytes([message[2], message[3]]) as u32;
             let y = u16::from_be_bytes([message[4], message[5]]) as u32;
 
-            let _ = input_sender.send(VncInputEvent::MouseButton {
-                button: 0,
-                down: (mask & 1) != 0,
-            });
-            let _ = input_sender.send(VncInputEvent::MouseButton {
-                button: 1,
-                down: (mask & 2) != 0,
-            });
-            let _ = input_sender.send(VncInputEvent::MouseButton {
-                button: 2,
-                down: (mask & 4) != 0,
-            });
+            let changed_buttons = client_state.pointer_button_mask ^ mask;
+            for (bit, button) in [(1, 0), (2, 1), (4, 2)] {
+                if changed_buttons & bit != 0 {
+                    let _ = input_sender.send(VncInputEvent::MouseButton {
+                        button,
+                        down: mask & bit != 0,
+                    });
+                }
+            }
+            client_state.pointer_button_mask = mask;
             let _ = input_sender.send(VncInputEvent::PointerPosition { x, y });
 
             debug!("vnc: pointer event mask={mask} x={x} y={y}");
@@ -799,13 +947,16 @@ fn handle_client_message(message: &[u8], input_sender: &mpsc::Sender<VncInputEve
         }
         _ => unreachable!("client_message_size validates message types"),
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::VecDeque;
     use std::io::Cursor;
+
+    use super::*;
 
     struct MockSocket {
         read_buf: Cursor<Vec<u8>>,
@@ -936,13 +1087,26 @@ mod tests {
         let (input_sender, input_receiver) = mpsc::channel();
         let mut reader = NonBlockingReader::new([vec![4, 1, 0, 0, 0, 0]]);
         let mut input_buffer = Vec::new();
+        let mut client_state = ClientState::default();
 
-        check_client_input(&mut reader, &input_sender, &mut input_buffer).unwrap();
+        check_client_input(
+            &mut reader,
+            &input_sender,
+            &mut input_buffer,
+            &mut client_state,
+        )
+        .unwrap();
         assert!(input_receiver.try_recv().is_err());
         assert_eq!(input_buffer, vec![4, 1, 0, 0, 0, 0]);
 
         reader.queue_read_data(vec![0, 0x66]); // X11 keysym 'f'
-        check_client_input(&mut reader, &input_sender, &mut input_buffer).unwrap();
+        check_client_input(
+            &mut reader,
+            &input_sender,
+            &mut input_buffer,
+            &mut client_state,
+        )
+        .unwrap();
 
         assert!(matches!(
             input_receiver.recv().unwrap(),
@@ -957,12 +1121,13 @@ mod tests {
     #[test]
     fn test_set_encodings_does_not_consume_following_key_event() {
         let (input_sender, input_receiver) = mpsc::channel();
+        let mut client_state = ClientState::default();
         let mut input_buffer = vec![
             2, 0, 0, 1, 0, 0, 0, 0, // SetEncodings with one Raw encoding.
             4, 1, 0, 0, 0, 0, 0, 0x66, // KeyEvent for 'f'.
         ];
 
-        drain_client_input(&mut input_buffer, &input_sender).unwrap();
+        drain_client_input(&mut input_buffer, &input_sender, &mut client_state).unwrap();
 
         assert!(matches!(
             input_receiver.recv().unwrap(),
@@ -972,5 +1137,84 @@ mod tests {
             }
         ));
         assert!(input_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_set_pixel_format_is_twenty_bytes() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let mut client_state = ClientState::default();
+        let mut input_buffer = vec![
+            // SetPixelFormat selecting little-endian RGB565.
+            0, 0, 0, 0, 16, 16, 0, 1, 0, 31, 0, 63, 0, 31, 11, 5, 0, 0, 0, 0,
+            // SetEncodings with one Raw encoding.
+            2, 0, 0, 1, 0, 0, 0, 0, // KeyEvent for 'f'.
+            4, 1, 0, 0, 0, 0, 0, 0x66,
+        ];
+
+        drain_client_input(&mut input_buffer, &input_sender, &mut client_state).unwrap();
+
+        assert_eq!(client_state.pixel_format.bits_per_pixel, 16);
+        assert_eq!(client_state.pixel_format.red_shift, 11);
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::Keyboard {
+                key: 0x66,
+                down: true,
+            }
+        ));
+        assert!(input_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_rgb565_conversion() {
+        let format = PixelFormat {
+            bits_per_pixel: 16,
+            depth: 16,
+            big_endian: false,
+            red_max: 31,
+            green_max: 63,
+            blue_max: 31,
+            red_shift: 11,
+            green_shift: 5,
+            blue_shift: 0,
+        };
+        let mut output = Vec::new();
+
+        // Source pixels are blue, green, and red byte order (XRGB8888).
+        write_pixels(
+            &mut output,
+            &[0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0],
+            format,
+        )
+        .unwrap();
+
+        assert_eq!(output, [0x00, 0xf8, 0xe0, 0x07, 0x1f, 0x00]);
+    }
+
+    #[test]
+    fn test_pointer_sends_only_changed_buttons() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let mut client_state = ClientState::default();
+
+        handle_client_message(&[5, 0, 0, 10, 0, 20], &input_sender, &mut client_state).unwrap();
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::PointerPosition { x: 10, y: 20 }
+        ));
+        assert!(input_receiver.try_recv().is_err());
+
+        handle_client_message(&[5, 1, 0, 11, 0, 21], &input_sender, &mut client_state).unwrap();
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::MouseButton {
+                button: 0,
+                down: true,
+            }
+        ));
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::PointerPosition { x: 11, y: 21 }
+        ));
+        assert!(input_receiver.try_recv().is_err());
     }
 }
