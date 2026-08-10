@@ -243,10 +243,14 @@ impl KeyboardMap {
                 vec![make_code]
             }
         } else {
+            // The controller advertises translated scan code set 1. Set 1 break
+            // codes have bit 7 set; 0xF0 is the set 2 break prefix and would make
+            // the guest interpret the following make code as another key press.
+            let break_code = make_code | 0x80;
             if e0 {
-                vec![0xE0, 0xF0, make_code]
+                vec![0xE0, break_code]
             } else {
-                vec![0xF0, make_code]
+                vec![break_code]
             }
         }
     }
@@ -857,9 +861,22 @@ mod tests {
         assert_eq!(dev.output_buffer[0], 0x10);
 
         dev.process_keyboard_event(0x71, false);
-        assert_eq!(dev.output_buffer.len(), 3);
-        assert_eq!(dev.output_buffer[1], 0xF0);
-        assert_eq!(dev.output_buffer[2], 0x10);
+        assert_eq!(dev.output_buffer.len(), 2);
+        assert_eq!(dev.output_buffer[1], 0x90);
+    }
+
+    #[test]
+    fn test_extended_keyboard_scan_codes() {
+        let mut dev = make_device();
+
+        // X11 keysym 0xFF53 (Right) uses an E0-prefixed Set 1 scan code.
+        dev.process_keyboard_event(0xFF53, true);
+        dev.process_keyboard_event(0xFF53, false);
+
+        assert_eq!(
+            dev.output_buffer.make_contiguous(),
+            &[0xE0, 0x4D, 0xE0, 0xCD]
+        );
     }
 
     #[test]
