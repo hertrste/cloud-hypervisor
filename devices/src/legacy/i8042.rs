@@ -161,19 +161,43 @@ impl KeyboardMap {
             0x38 => (0x09, false), // 8
             0x39 => (0x0A, false), // 9
 
-            // Punctuation / symbols
+            // Punctuation / symbols. Shifted symbols use the scan code for
+            // their unshifted key; the client sends the Shift keysym separately.
             0x20 => (0x39, false), // Space
             0x60 => (0x29, false), // Grave (`)
+            0x7E => (0x29, false), // Tilde (~)
             0x2D => (0x0C, false), // Minus (-)
+            0x5F => (0x0C, false), // Underscore (_)
             0x3D => (0x0D, false), // Equals (=)
+            0x2B => (0x0D, false), // Plus (+)
             0x5B => (0x1A, false), // Left Bracket ([)
+            0x7B => (0x1A, false), // Left Brace ({)
             0x5D => (0x1B, false), // Right Bracket (])
+            0x7D => (0x1B, false), // Right Brace (})
             0x5C => (0x2B, false), // Backslash (\)
+            0x7C => (0x2B, false), // Pipe (|)
             0x3B => (0x27, false), // Semicolon (;)
+            0x3A => (0x27, false), // Colon (:)
             0x27 => (0x28, false), // Quote (')
+            0x22 => (0x28, false), // Double quote (")
             0x2C => (0x33, false), // Comma (,)
+            0x3C => (0x33, false), // Less-than (<)
             0x2E => (0x34, false), // Period (.)
+            0x3E => (0x34, false), // Greater-than (>)
             0x2F => (0x35, false), // Slash (/)
+            0x3F => (0x35, false), // Question mark (?)
+
+            // Shifted number-row symbols
+            0x21 => (0x02, false), // Exclamation mark (!)
+            0x40 => (0x03, false), // At sign (@)
+            0x23 => (0x04, false), // Number sign (#)
+            0x24 => (0x05, false), // Dollar sign ($)
+            0x25 => (0x06, false), // Percent sign (%)
+            0x5E => (0x07, false), // Caret (^)
+            0x26 => (0x08, false), // Ampersand (&)
+            0x2A => (0x09, false), // Asterisk (*)
+            0x28 => (0x0A, false), // Left parenthesis
+            0x29 => (0x0B, false), // Right parenthesis
 
             // Control keys
             0xFF1B => (0x01, false), // Escape
@@ -1237,6 +1261,70 @@ mod tests {
         dev.process_keyboard_event(0x71, false);
         assert_eq!(dev.output_buffer.len(), 2);
         assert_eq!(dev.output_buffer[1], 0x90);
+    }
+
+    #[test]
+    fn test_shifted_keyboard_symbols() {
+        let mut dev = make_device();
+
+        // VNC sends Shift and the resulting X11 keysym as distinct events.
+        dev.process_keyboard_event(0xFFE1, true);
+        dev.process_keyboard_event(0x21, true); // !
+        dev.process_keyboard_event(0x21, false);
+        dev.process_keyboard_event(0xFFE1, false);
+
+        assert_eq!(dev.output_buffer, VecDeque::from([0x2A, 0x02, 0x82, 0xAA]));
+    }
+
+    #[test]
+    fn test_shifted_symbol_keysyms_map_to_base_keys() {
+        let symbols = [
+            (0x7E, 0x29), // ~
+            (0x5F, 0x0C), // _
+            (0x2B, 0x0D), // +
+            (0x7B, 0x1A), // {
+            (0x7D, 0x1B), // }
+            (0x7C, 0x2B), // |
+            (0x3A, 0x27), // :
+            (0x22, 0x28), // "
+            (0x3C, 0x33), // <
+            (0x3E, 0x34), // >
+            (0x3F, 0x35), // ?
+            (0x21, 0x02), // !
+            (0x40, 0x03), // @
+            (0x23, 0x04), // #
+            (0x24, 0x05), // $
+            (0x25, 0x06), // %
+            (0x5E, 0x07), // ^
+            (0x26, 0x08), // &
+            (0x2A, 0x09), // *
+            (0x28, 0x0A), // (
+            (0x29, 0x0B), // )
+        ];
+
+        for (keysym, make_code) in symbols {
+            assert_eq!(KeyboardMap::scan_codes(keysym, true, true), [make_code]);
+            assert_eq!(
+                KeyboardMap::scan_codes(keysym, false, true),
+                [make_code | 0x80]
+            );
+        }
+    }
+
+    #[test]
+    fn test_shifted_keyboard_symbols_in_set2() {
+        let mut dev = make_device();
+        dev.ctr &= !CTR_XLATE;
+
+        dev.process_keyboard_event(0xFFE1, true);
+        dev.process_keyboard_event(0x3F, true); // ?
+        dev.process_keyboard_event(0x3F, false);
+        dev.process_keyboard_event(0xFFE1, false);
+
+        assert_eq!(
+            dev.output_buffer,
+            VecDeque::from([0x12, 0x4A, 0xF0, 0x4A, 0xF0, 0x12])
+        );
     }
 
     #[test]
