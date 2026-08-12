@@ -764,11 +764,11 @@ pub struct DisplayConfig {
 }
 
 fn default_display_width() -> u32 {
-    1024
+    800
 }
 
 fn default_display_height() -> u32 {
-    768
+    600
 }
 
 impl Default for DisplayConfig {
